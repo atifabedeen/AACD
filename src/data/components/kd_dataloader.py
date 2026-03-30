@@ -29,12 +29,24 @@ class RandomCropAndResize(object):
 
 
 class KDDataset(Dataset):
-    def __init__(self, data_name, data_root, attributes, split='train'):
-        self.root_dir = data_root
+    def __init__(self, data_name, data_root, attributes, split="train"):
+        self.root_dir = self.resolve_root_dir(data_root, data_name)
         self.split = split
         self.transform = self.get_transform(split)
         self.dataloader = self.get_dataloader(data_name)
         self.attributes = attributes #prompt_tmpl, class_num, classes
+
+    def resolve_root_dir(self, data_root, data_name):
+        if os.path.exists(data_root):
+            return data_root
+
+        name_parts = data_name.split("_", 1)
+        if len(name_parts) == 2 and name_parts[0].isdigit():
+            alt_root = os.path.join(os.path.dirname(os.path.normpath(data_root)), name_parts[1])
+            if os.path.exists(alt_root):
+                return alt_root
+
+        return data_root
 
     def get_transform(self, split):
         normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],

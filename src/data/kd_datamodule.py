@@ -1,56 +1,42 @@
-from typing import Any, Dict, Optional, Tuple
+import copy
+from typing import Any, Dict, Optional
 
 import torch
 from lightning import LightningDataModule
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
-from torchvision.datasets import MNIST
-from torchvision.transforms import transforms
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
+
+
+class IndexedDataset(Dataset):
+    def __init__(self, base_dataset: Dataset, indices, attributes) -> None:
+        self.base_dataset = base_dataset
+        self.indices = list(indices)
+        self.attributes = attributes
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.base_dataset[self.indices[idx]]
+
+    @property
+    def transform(self):
+        datasets = getattr(self.base_dataset, "datasets", None)
+        if datasets:
+            return getattr(datasets[0], "transform", None)
+        return getattr(self.base_dataset, "transform", None)
+
+    @transform.setter
+    def transform(self, value) -> None:
+        datasets = getattr(self.base_dataset, "datasets", None)
+        if datasets:
+            for dataset in datasets:
+                if hasattr(dataset, "transform"):
+                    dataset.transform = value
+        elif hasattr(self.base_dataset, "transform"):
+            self.base_dataset.transform = value
+
 
 class KDDataModule(LightningDataModule):
-    """`LightningDataModule` for the MNIST dataset.
-
-    The MNIST database of handwritten digits has a training set of 60,000 examples, and a test set of 10,000 examples.
-    It is a subset of a larger set available from NIST. The digits have been size-normalized and centered in a
-    fixed-size image. The original black and white images from NIST were size normalized to fit in a 20x20 pixel box
-    while preserving their aspect ratio. The resulting images contain grey levels as a result of the anti-aliasing
-    technique used by the normalization algorithm. the images were centered in a 28x28 image by computing the center of
-    mass of the pixels, and translating the image so as to position this point at the center of the 28x28 field.
-
-    A `LightningDataModule` implements 7 key methods:
-
-    ```python
-        def prepare_data(self):
-        # Things to do on 1 GPU/TPU (not on every GPU/TPU in DDP).
-        # Download data, pre-process, split, save to disk, etc...
-
-        def setup(self, stage):
-        # Things to do on every process in DDP.
-        # Load data, set variables, etc...
-
-        def train_dataloader(self):
-        # return train dataloader
-
-        def val_dataloader(self):
-        # return validation dataloader
-
-        def test_dataloader(self):
-        # return test dataloader
-
-        def predict_dataloader(self):
-        # return predict dataloader
-
-        def teardown(self, stage):
-        # Called on every process in DDP.
-        # Clean up after fit or test.
-    ```
-
-    This allows you to share a full dataset without explaining how to download,
-    split, transform and process the data.
-
-    Read the docs:
-        https://lightning.ai/docs/pytorch/latest/data/datamodule.html
-    """
-
     def __init__(
         self,
         train_dataset: Dataset,
@@ -60,56 +46,29 @@ class KDDataModule(LightningDataModule):
         batch_size: int = 64,
         num_workers: int = 0,
         pin_memory: bool = False,
+        split_seed: int = 42,
     ) -> None:
-        """Initialize a `MNISTDataModule`.
-
-        :param data_dir: The data directory. Defaults to `"data/"`.
-        :param train_val_test_split: The train, validation and test split. Defaults to `(55_000, 5_000, 10_000)`.
-        :param batch_size: The batch size. Defaults to `64`.
-        :param num_workers: The number of workers. Defaults to `0`.
-        :param pin_memory: Whether to pin memory. Defaults to `False`.
-        """
         super().__init__()
+        self.save_hyperparameters(ignore=["train_dataset", "test_dataset"], logger=False)
 
-        # this line allows to access init params with 'self.hparams' attribute
-        # also ensures init params will be stored in ckpt
-        self.save_hyperparameters(logger=False)
+        self.train_source = train_dataset
+        self.test_source = test_dataset
+        self.attributes = attributes
 
-        self.data_train: Optional[Dataset] = train_dataset.dataloader
-        self.data_val: Optional[Dataset] = test_dataset.dataloader
-        self.data_test: Optional[Dataset] = test_dataset.dataloader
+        self.data_train: Optional[Dataset] = None
+        self.data_val: Optional[Dataset] = None
+        self.data_test: Optional[Dataset] = None
 
         self.batch_size_per_device = batch_size
 
     @property
     def num_classes(self) -> int:
-        """Get the number of classes.
-
-        :return: The number of MNIST classes (10).
-        """
-        return self.data_train.attributes.num_classes
+        return self.attributes.class_num
 
     def prepare_data(self) -> None:
-        """Download data if needed. Lightning ensures that `self.prepare_data()` is called only
-        within a single process on CPU, so you can safely add your downloading logic within. In
-        case of multi-node training, the execution of this hook depends upon
-        `self.prepare_data_per_node()`.
-
-        Do not use it to assign state (self.x = y).
-        """
-
+        pass
 
     def setup(self, stage: Optional[str] = None) -> None:
-        """Load data. Set variables: `self.data_train`, `self.data_val`, `self.data_test`.
-
-        This method is called by Lightning before `trainer.fit()`, `trainer.validate()`, `trainer.test()`, and
-        `trainer.predict()`, so be careful not to execute things like random split twice! Also, it is called after
-        `self.prepare_data()` and there is a barrier in between which ensures that all the processes proceed to
-        `self.setup()` once the data is prepared and available for use.
-
-        :param stage: The stage to setup. Either `"fit"`, `"validate"`, `"test"`, or `"predict"`. Defaults to ``None``.
-        """
-        # Divide batch size by the number of devices.
         if self.trainer is not None:
             if self.hparams.batch_size % self.trainer.world_size != 0:
                 raise RuntimeError(
@@ -117,13 +76,46 @@ class KDDataModule(LightningDataModule):
                 )
             self.batch_size_per_device = self.hparams.batch_size // self.trainer.world_size
 
+        if self.data_train is None and self.data_val is None and self.data_test is None:
+            self._build_splits()
 
+    def _build_splits(self) -> None:
+        train_transform = self.train_source.transform
+        eval_transform = self.test_source.transform
+
+        train_augmented = copy.deepcopy(self.train_source.dataloader)
+        test_augmented = copy.deepcopy(self.test_source.dataloader)
+        train_eval = copy.deepcopy(self.train_source.dataloader)
+        test_eval = copy.deepcopy(self.test_source.dataloader)
+
+        for dataset in (train_augmented, test_augmented):
+            if hasattr(dataset, "transform"):
+                dataset.transform = train_transform
+
+        for dataset in (train_eval, test_eval):
+            if hasattr(dataset, "transform"):
+                dataset.transform = eval_transform
+
+        augmented_full = ConcatDataset([train_augmented, test_augmented])
+        eval_full = ConcatDataset([train_eval, test_eval])
+
+        total_size = len(eval_full)
+        train_size = int(total_size * 0.70)
+        val_size = int(total_size * 0.15)
+        test_size = total_size - train_size - val_size
+
+        generator = torch.Generator().manual_seed(self.hparams.split_seed)
+        indices = torch.randperm(total_size, generator=generator).tolist()
+
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:train_size + val_size]
+        test_indices = indices[train_size + val_size:train_size + val_size + test_size]
+
+        self.data_train = IndexedDataset(augmented_full, train_indices, self.attributes)
+        self.data_val = IndexedDataset(eval_full, val_indices, self.attributes)
+        self.data_test = IndexedDataset(eval_full, test_indices, self.attributes)
 
     def train_dataloader(self) -> DataLoader[Any]:
-        """Create and return the train dataloader.
-
-        :return: The train dataloader.
-        """
         return DataLoader(
             dataset=self.data_train,
             batch_size=self.batch_size_per_device,
@@ -133,10 +125,6 @@ class KDDataModule(LightningDataModule):
         )
 
     def val_dataloader(self) -> DataLoader[Any]:
-        """Create and return the validation dataloader.
-
-        :return: The validation dataloader.
-        """
         return DataLoader(
             dataset=self.data_val,
             batch_size=self.batch_size_per_device,
@@ -146,10 +134,6 @@ class KDDataModule(LightningDataModule):
         )
 
     def test_dataloader(self) -> DataLoader[Any]:
-        """Create and return the test dataloader.
-
-        :return: The test dataloader.
-        """
         return DataLoader(
             dataset=self.data_test,
             batch_size=self.batch_size_per_device,
@@ -159,27 +143,12 @@ class KDDataModule(LightningDataModule):
         )
 
     def teardown(self, stage: Optional[str] = None) -> None:
-        """Lightning hook for cleaning up after `trainer.fit()`, `trainer.validate()`,
-        `trainer.test()`, and `trainer.predict()`.
-
-        :param stage: The stage being torn down. Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
-            Defaults to ``None``.
-        """
         pass
 
     def state_dict(self) -> Dict[Any, Any]:
-        """Called when saving a checkpoint. Implement to generate and save the datamodule state.
-
-        :return: A dictionary containing the datamodule state that you want to save.
-        """
         return {}
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Called when loading a checkpoint. Implement to reload datamodule state given datamodule
-        `state_dict()`.
-
-        :param state_dict: The datamodule state returned by `self.state_dict()`.
-        """
         pass
 
 

@@ -152,3 +152,6 @@ configs/local/default.yaml
 
 # Aim logging
 .aim
+v2lite_env/
+data/
+kd_datasets/

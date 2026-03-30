@@ -59,17 +59,20 @@ class KDModule(LightningModule):
 
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
-        self.save_hyperparameters(logger=False)
+        self.save_hyperparameters(ignore=["net", "optimizer", "scheduler", "kd_criterion"], logger=False)
 
         self.net = net
+        self.optimizer_factory = optimizer
+        self.scheduler_factory = scheduler
         self.use_teacher = use_teacher
+        self.compile_model = compile
         if use_teacher:
             self.kd_criterion = kd_criterion
         # loss function
         self.criterion = torch.nn.CrossEntropyLoss()
 
         # metric objects for calculating and averaging accuracy across batches
-        num_classes = self.hparams.net.data_attributes.class_num
+        num_classes = self.net.data_attributes.class_num
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.test_acc = Accuracy(task="multiclass", num_classes=num_classes)
@@ -229,7 +232,7 @@ class KDModule(LightningModule):
 
         :param stage: Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
         """
-        if self.hparams.compile and stage == "fit":
+        if self.compile_model and stage == "fit":
             self.net = torch.compile(self.net)
 
     def configure_optimizers(self) -> Dict[str, Any]:
@@ -241,9 +244,9 @@ class KDModule(LightningModule):
 
         :return: A dict containing the configured optimizers and learning-rate schedulers to be used for training.
         """
-        optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
-        if self.hparams.scheduler is not None:
-            scheduler = self.hparams.scheduler(optimizer=optimizer)
+        optimizer = self.optimizer_factory(params=self.trainer.model.parameters())
+        if self.scheduler_factory is not None:
+            scheduler = self.scheduler_factory(optimizer=optimizer)
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {

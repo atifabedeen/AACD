@@ -1,0 +1,71 @@
+_target_: src.models.aacd_module.AACDModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.0001
+  weight_decay: 0.0
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.StepLR
+  _partial_: true
+  step_size: 30
+  gamma: 0.5
+
+# Shared logger config expects this flag to exist for all model variants.
+# AACD always uses frozen teachers, so keep it enabled here.
+use_teacher: true
+
+# ---- Network ----------------------------------------------------------
+net:
+  _target_: src.models.components.aacd_campus.AACDTeacherStudent
+
+  # CLIP teacher (same as VL2Lite baseline)
+  teacher:
+    arch: convnext_xxlarge
+    pretrained: laion2b_s34b_b82k_augreg_soup
+
+  # DINOv2 teacher
+  # For fast debugging:  dinov2_vits14  (384-dim)
+  # For final results:   dinov2_vitg14  (1536-dim)
+  dino:
+    model_name: dinov2_vits14
+
+  # Student
+  student:
+    arch: resnet18
+
+  # Dataset attributes injected automatically
+  data_attributes: ${data.train_dataset.attributes}
+
+  # CCA shared space dimensionality.
+  # Must equal cca_s below (set both to the same value).
+  shared_dim: 256
+
+  # Agreement temperature  w = exp(-alpha * delta)
+  # Larger  →  stricter filtering of disagreed samples.
+  agreement_alpha: 2.0
+
+# ---- AACD loss --------------------------------------------------------
+kd_criterion:
+  _target_: src.models.components.aacd_criterion.AACDCriterion
+  temperature:    2.0
+  lambda_cls:     0.01   # grows to 1.0 dynamically over training
+  lambda_shared:  0.3    # agreement-weighted CCA distillation
+  lambda_vis:     0.2    # agreement-weighted visual KD (L1, CLIP)
+  lambda_txt:     0.2    # agreement-weighted linguistic KD (KL, CLIP text)
+  lambda_geom:    0.1    # geometry preservation (AE-SVC)
+  class_num: ${data.train_dataset.attributes.class_num}
+
+# ---- CCA settings (used in AACDModule.setup) -------------------------
+# cca_s must equal net.shared_dim above.
+# Set cca_s: 0 to let CCA auto-detect s from cca_tau.
+cca_s:   256
+cca_tau: 0.1       # correlation threshold for auto-detect (only if cca_s=0)
+
+# Directory for caching extracted teacher features across runs.
+# Defaults to current working directory.
+cache_dir: ".cache"
+
+# compile model for faster training with pytorch 2.0
+compile: false
