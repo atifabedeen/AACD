@@ -5,7 +5,7 @@ Total loss (proposal SS6):
 
   L = cls_w   * L_cls
     + kd_scale * lambda_shared * L_shared   (agreement-weighted CCA distillation)
-    + kd_scale * lambda_vis    * L_vis      (RKD on CLIP image features)
+    + kd_scale * lambda_vis    * L_vis      (symmetric visual KD from both teachers)
     + kd_scale * lambda_txt    * L_txt      (KL on CLIP text-similarity distribution)
     + lambda_geom              * L_geom     (AE-SVC geometry constraint)
     + kd_scale * lambda_feat   * L_feat     (agreement-weighted feature-wise distillation)
@@ -74,19 +74,22 @@ def agreement_shared_loss(
 
 
 # ---------------------------------------------------------------------------
-# Sub-loss: agreement-weighted relational KD on CLIP image features (VL2Lite)
+# Sub-loss: agreement-weighted visual KD (symmetric dual-teacher)
 # ---------------------------------------------------------------------------
 
 def agreement_visual_kd_loss(
     student_feats: torch.Tensor,    # (B, d_s)
     aligned_img: torch.Tensor,      # (B, d_s)  CLIP condensed to student dim
+    aligned_dino: torch.Tensor,     # (B, d_s)  DINOv2 condensed to student dim
     w: torch.Tensor,                # (B,)
 ) -> torch.Tensor:
     """
-    Per-sample L1 between student and aligned CLIP features, weighted by
-    agreement.  (Simple extension of VL2Lite's img_criterion.)
+    Per-sample L1 between student and each teacher's aligned features,
+    averaged across teachers and weighted by agreement.
     """
-    per_sample = (student_feats - aligned_img).abs().mean(dim=1)   # (B,)
+    clip_l1 = (student_feats - aligned_img).abs().mean(dim=1)    # (B,)
+    dino_l1 = (student_feats - aligned_dino).abs().mean(dim=1)   # (B,)
+    per_sample = 0.5 * (clip_l1 + dino_l1)
     return (w * per_sample).mean()
 
 
@@ -216,10 +219,11 @@ class AACDCriterion:
             w,
         )
 
-        # ---- 3. Agreement-weighted visual KD (L1, VL2Lite style) ----
+        # ---- 3. Agreement-weighted visual KD (symmetric, both teachers)
         loss_vis = agreement_visual_kd_loss(
             outputs["hidden_features"],
             outputs["aligned_img"],
+            outputs["aligned_dino"],
             w,
         )
 
@@ -235,7 +239,10 @@ class AACDCriterion:
         )
 
         # ---- 5. Geometry preservation --------------------------------
-        loss_geom = self.geo_loss(outputs["hidden_features"])
+        # Applied to student_shared (unconstrained CCA space) rather than
+        # hidden_features (L2-normalized), because the unit-variance target
+        # conflicts with L2 normalization (per-dim variance ≈ 1/d on the sphere).
+        loss_geom = self.geo_loss(outputs["student_shared"])
 
         # ---- 6. Feature-wise distillation (NanoSD-inspired) ----------
         proj_inter = outputs.get("projected_intermediates")

@@ -91,7 +91,7 @@ class AACDTeacherStudent(nn.Module):
             self.patch_agg = None
             self.feat_distill = None
 
-        # ---- VL2Lite alignment layers (image + text) ----------------
+        # ---- Alignment layers (teacher -> student space) -------------
         self.align_img = nn.Sequential(
             nn.Linear(clip_dim, student_dim),
             nn.ReLU(),
@@ -99,6 +99,11 @@ class AACDTeacherStudent(nn.Module):
         )
         self.align_nlp = nn.Sequential(
             nn.Linear(clip_dim, student_dim),
+            nn.ReLU(),
+            nn.Linear(student_dim, student_dim),
+        )
+        self.align_dino = nn.Sequential(
+            nn.Linear(dino_dim, student_dim),
             nn.ReLU(),
             nn.Linear(student_dim, student_dim),
         )
@@ -149,6 +154,7 @@ class AACDTeacherStudent(nn.Module):
           dino_img_feats         (B, dino_dim)     - normed DINOv2 feats
           frozen_nlp_feats       (C, clip_dim)     - text embeddings
           aligned_img            (B, student_dim)  - condensed CLIP img feats
+          aligned_dino           (B, student_dim)  - condensed DINOv2 img feats
           aligned_nlp            (C, student_dim)  - condensed text feats
           student_shared         (B, shared_dim)   - student in CCA space
           shared_target          (B, shared_dim)   - CCA avg signal (detached)
@@ -162,9 +168,10 @@ class AACDTeacherStudent(nn.Module):
 
         frozen_nlp = self.frozen_nlp_features.to(x.device)   # (C, clip_dim)
 
-        # ---- VL2Lite alignment layers --------------------------------
-        aligned_img = feature_norm(self.align_img(clip_img))   # (B, student_dim)
-        aligned_nlp = feature_norm(self.align_nlp(frozen_nlp)) # (C, student_dim)
+        # ---- Alignment layers ----------------------------------------
+        aligned_img  = feature_norm(self.align_img(clip_img))    # (B, student_dim)
+        aligned_nlp  = feature_norm(self.align_nlp(frozen_nlp))  # (C, student_dim)
+        aligned_dino = feature_norm(self.align_dino(dino_img))   # (B, student_dim)
 
         # ---- Student forward -----------------------------------------
         projected_intermediates = None
@@ -203,6 +210,7 @@ class AACDTeacherStudent(nn.Module):
             "dino_img_feats":         dino_img,
             "frozen_nlp_feats":       frozen_nlp,
             "aligned_img":            aligned_img,
+            "aligned_dino":           aligned_dino,
             "aligned_nlp":            aligned_nlp,
             "student_shared":         student_shared,
             "shared_target":          z_shared.detach(),
