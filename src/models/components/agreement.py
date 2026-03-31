@@ -35,7 +35,14 @@ from src.models.components.cca_module import CCAProjection
 class AgreementModule(nn.Module):
     """Per-sample agreement weighting between two frozen teachers."""
 
-    def __init__(self, num_classes: int, shared_dim: int, alpha: float = 2.0):
+    def __init__(
+        self,
+        num_classes: int,
+        shared_dim: int,
+        alpha: float = 2.0,
+        clip_dim: int | None = None,
+        dino_dim: int | None = None,
+    ):
         """
         Parameters
         ----------
@@ -48,14 +55,21 @@ class AgreementModule(nn.Module):
         self.num_classes = num_classes
         self.shared_dim = shared_dim
         self.alpha = alpha
+        self.clip_dim = clip_dim
+        self.dino_dim = dino_dim
 
-        # Projection matrices and training-set means stored as buffers so
-        # they persist in checkpoints.  Placeholder shapes; replaced by
-        # initialize() once CCA is fitted.
-        self.register_buffer("_A", torch.zeros(shared_dim, 1))       # (s, dim_c)
-        self.register_buffer("_B", torch.zeros(shared_dim, 1))       # (s, dim_d)
-        self.register_buffer("_mean_c", torch.zeros(1))              # (dim_c,)
-        self.register_buffer("_mean_d", torch.zeros(1))              # (dim_d,)
+        # Projection matrices and training-set means are stored as buffers
+        # so they persist in checkpoints. Allocate final shapes up front
+        # whenever the teacher dimensions are known to keep load_state_dict
+        # stable across save/load cycles.
+        a_shape = (shared_dim, clip_dim) if clip_dim is not None else (shared_dim, 1)
+        b_shape = (shared_dim, dino_dim) if dino_dim is not None else (shared_dim, 1)
+        mean_c_shape = (clip_dim,) if clip_dim is not None else (1,)
+        mean_d_shape = (dino_dim,) if dino_dim is not None else (1,)
+        self.register_buffer("_A", torch.zeros(a_shape))             # (s, dim_c)
+        self.register_buffer("_B", torch.zeros(b_shape))             # (s, dim_d)
+        self.register_buffer("_mean_c", torch.zeros(mean_c_shape))   # (dim_c,)
+        self.register_buffer("_mean_d", torch.zeros(mean_d_shape))   # (dim_d,)
 
         # Class prototypes in the shared CCA space (L2-normalised).
         self.register_buffer(

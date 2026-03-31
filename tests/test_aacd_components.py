@@ -153,6 +153,34 @@ def test_text_kd_is_decoupled_from_agreement_weight() -> None:
     assert loss_ref["txt_gated"] != loss_low["txt_gated"]
 
 
+def test_agreement_module_state_dict_reloads_with_fixed_dims() -> None:
+    rng = np.random.default_rng(1)
+    clip = rng.normal(size=(12, 4))
+    dino = rng.normal(size=(12, 3))
+    labels = torch.tensor([0] * 6 + [1] * 6)
+
+    cca = CCAProjection(dim_c=4, dim_d=3, s=2, reg=1e-3)
+    cca.fit(clip, dino)
+
+    agreement = AgreementModule(num_classes=2, shared_dim=2, clip_dim=4, dino_dim=3)
+    agreement.initialize(
+        cca,
+        torch.tensor(clip, dtype=torch.float32),
+        torch.tensor(dino, dtype=torch.float32),
+        labels,
+    )
+
+    restored = AgreementModule(num_classes=2, shared_dim=2, clip_dim=4, dino_dim=3)
+    restored.load_state_dict(agreement.state_dict())
+
+    assert restored._initialized
+    assert_close(restored._A, agreement._A)
+    assert_close(restored._B, agreement._B)
+    assert_close(restored._mean_c, agreement._mean_c)
+    assert_close(restored._mean_d, agreement._mean_d)
+    assert_close(restored.prototypes, agreement.prototypes)
+
+
 def test_mobilevit_logits_use_aggregated_hidden_features() -> None:
     model = AACDTeacherStudent.__new__(AACDTeacherStudent)
     nn.Module.__init__(model)

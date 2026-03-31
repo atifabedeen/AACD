@@ -120,6 +120,8 @@ class AACDTeacherStudent(nn.Module):
             num_classes=data_attributes.class_num,
             shared_dim=shared_dim,
             alpha=agreement_alpha,
+            clip_dim=clip_dim,
+            dino_dim=dino_dim,
         )
 
         # ---- Frozen text features ------------------------------------
