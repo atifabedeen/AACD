@@ -1,0 +1,41 @@
+# @package _global_
+
+# Minimal AACD debug run:
+#   python src/train.py experiment=aacd_debug
+
+defaults:
+  - override /model: aacd
+  - override /data: kd_data
+  - override /callbacks: default
+  - override /trainer: cpu
+
+tags: ["aacd", "debug"]
+
+seed: 42
+
+trainer:
+  max_epochs: 1
+  limit_train_batches: 2
+  limit_val_batches: 1
+  limit_test_batches: 1
+  log_every_n_steps: 1
+
+data:
+  attributes:
+    name: 0_CUB_200_2011
+  batch_size: 8
+  num_workers: 0
+  pin_memory: false
+
+model:
+  net:
+    student:
+      arch: mobilevit_xxs
+    dino:
+      model_name: dinov2_vits14
+    use_mobilevit: true
+    shared_dim: 128
+    agreement_alpha: 2.0
+  kd_criterion:
+    lambda_feat: 0.0
+  cca_s: 128

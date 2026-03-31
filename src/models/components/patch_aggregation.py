@@ -4,8 +4,8 @@ Semantic-aware patch token aggregation (proposal SS5.9).
 Learns per-patch attention weights and aggregates patch tokens into a
 single global representation:
 
-    a_j  = sigmoid(W @ s_j)        (B, N, 1)
-    s    = sum_j  a_j * s_j        (B, D)
+    a_j  = softmax(W @ s_j)         (B, N, 1)
+    s    = sum_j  a_j * s_j         (B, D)
 """
 
 from __future__ import annotations
@@ -31,9 +31,9 @@ class SemanticAwareAggregation(nn.Module):
 
         Returns
         -------
-        aggregated : (B, D)  attention-weighted global feature.
-        weights    : (B, N)  per-patch attention weights.
+        aggregated : (B, D) attention-weighted global feature.
+        weights    : (B, N) normalized per-patch attention weights.
         """
-        weights = torch.sigmoid(self.gate(patch_tokens))   # (B, N, 1)
-        aggregated = (weights * patch_tokens).sum(dim=1)   # (B, D)
+        weights = torch.softmax(self.gate(patch_tokens), dim=1)  # (B, N, 1)
+        aggregated = (weights * patch_tokens).sum(dim=1)         # (B, D)
         return aggregated, weights.squeeze(-1)

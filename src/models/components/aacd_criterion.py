@@ -18,7 +18,6 @@ Dynamic weighting follows VL2Lite (SS3.5):
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,7 +43,7 @@ class GeometryPreservationLoss(nn.Module):
         """z : (B, d) student feature vectors."""
         B, d = z.shape
         z_c = z - z.mean(dim=0, keepdim=True)         # centred
-        cov = (z_c.T @ z_c) / B                        # (d, d)
+        cov = (z_c.T @ z_c) / B                       # (d, d)
 
         # Off-diagonal covariance -> 0  (exclude diagonal to avoid double-counting with loss_var)
         off_diag_mask = ~torch.eye(d, dtype=torch.bool, device=z.device)
@@ -79,8 +78,8 @@ def agreement_shared_loss(
 
 def agreement_visual_kd_loss(
     student_feats: torch.Tensor,    # (B, d_s)
-    aligned_img: torch.Tensor,      # (B, d_s)  CLIP condensed to student dim
-    aligned_dino: torch.Tensor,     # (B, d_s)  DINOv2 condensed to student dim
+    aligned_img: torch.Tensor,      # (B, d_s) CLIP condensed to student dim
+    aligned_dino: torch.Tensor,     # (B, d_s) DINOv2 condensed to student dim
     w: torch.Tensor,                # (B,)
 ) -> torch.Tensor:
     """
@@ -94,22 +93,22 @@ def agreement_visual_kd_loss(
 
 
 # ---------------------------------------------------------------------------
-# Sub-loss: agreement-weighted linguistic KD (VL2Lite text similarity)
+# Sub-loss: linguistic KD (VL2Lite text similarity)
 # ---------------------------------------------------------------------------
 
 def agreement_linguistic_kd_loss(
     student_feats: torch.Tensor,       # (B, d_s)
-    aligned_nlp: torch.Tensor,         # (C, d_s)   condensed text feats
+    aligned_nlp: torch.Tensor,         # (C, d_s) condensed text feats
     clip_img_feats: torch.Tensor,      # (B, clip_dim)
     frozen_nlp_feats: torch.Tensor,    # (C, clip_dim)
-    w: torch.Tensor,                   # (B,)
+    sample_weight: torch.Tensor | None,
     temperature: float,
     logit_scale: float,
 ) -> torch.Tensor:
     """
     KL divergence between student and CLIP cosine-similarity distributions
-    over class text embeddings, weighted by agreement.
-    Mirrors VL2Lite's kd_loss (criterion.py).
+    over class text embeddings. The agreement weight is optional so text KD
+    can remain active even when CLIP and DINO disagree.
     """
     C = aligned_nlp.size(0)
 
@@ -119,13 +118,16 @@ def agreement_linguistic_kd_loss(
     teacher_logits = logit_scale * clip_img_feats @ frozen_nlp_feats.T / temperature  # (B, C)
 
     p_student = F.log_softmax(student_logits, dim=1)
-    p_teacher = F.softmax(teacher_logits,     dim=1)
+    p_teacher = F.softmax(teacher_logits, dim=1)
 
     # Per-sample KL
     kl_per_sample = F.kl_div(p_student, p_teacher, reduction="none").sum(dim=1)  # (B,)
 
-    loss = (temperature ** 2) * (w * kl_per_sample).mean() * C / 2
-    return loss
+    if sample_weight is None:
+        reduced = kl_per_sample.mean()
+    else:
+        reduced = (sample_weight * kl_per_sample).mean()
+    return (temperature ** 2) * reduced * C / 2
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +141,7 @@ def feature_wise_loss(
 ) -> torch.Tensor:
     """
     L1 between each projected student intermediate feature and the CCA
-    shared signal, weighted by agreement.  Averaged over scales.
+    shared signal, weighted by agreement. Averaged over scales.
     """
     total = torch.tensor(0.0, device=shared_target.device)
     for proj_feat in projected_intermediates:
@@ -170,22 +172,18 @@ class AACDCriterion:
         lambda_feat: float = 0.15,
         class_num: int = 200,
     ):
-        self.temperature  = temperature
-        self.lambda_cls   = lambda_cls
+        self.temperature = temperature
+        self.lambda_cls = lambda_cls
         self.lambda_shared = lambda_shared
-        self.lambda_vis   = lambda_vis
-        self.lambda_txt   = lambda_txt
-        self.lambda_geom  = lambda_geom
-        self.lambda_feat  = lambda_feat
-        self.class_num    = class_num
+        self.lambda_vis = lambda_vis
+        self.lambda_txt = lambda_txt
+        self.lambda_geom = lambda_geom
+        self.lambda_feat = lambda_feat
+        self.class_num = class_num
 
         self.ce = nn.CrossEntropyLoss()
         self.geo_loss = GeometryPreservationLoss()
-
-        logit_scale = torch.nn.Parameter(
-            torch.ones([]) * float(np.log(1 / 0.07)), requires_grad=False
-        )
-        self.logit_scale = float(logit_scale.exp())
+        self.logit_scale = float(1.0 / 0.07)
 
     def __call__(
         self,
@@ -203,11 +201,14 @@ class AACDCriterion:
         max_epochs : total training epochs
         """
         # ---- Dynamic weight scheduling (VL2Lite SS3.5) ---------------
-        progress  = epoch / max(max_epochs, 1)
-        cls_w     = self.lambda_cls + progress * (1.0 - self.lambda_cls)
-        kd_scale  = 1.0 - progress * 0.5          # 1.0 -> 0.5 over training
+        progress = epoch / max(max_epochs, 1)
+        cls_w = self.lambda_cls + progress * (1.0 - self.lambda_cls)
+        kd_scale = 1.0 - progress * 0.5          # 1.0 -> 0.5 over training
 
         w = outputs["agreement_w"]   # (B,)
+        logit_scale = outputs.get("clip_logit_scale", self.logit_scale)
+        if torch.is_tensor(logit_scale):
+            logit_scale = float(logit_scale.detach().item())
 
         # ---- 1. Classification loss ----------------------------------
         loss_cls = self.ce(outputs["logits"], labels)
@@ -227,21 +228,27 @@ class AACDCriterion:
             w,
         )
 
-        # ---- 4. Agreement-weighted linguistic KD (KL, VL2Lite style) -
+        # ---- 4. Linguistic KD (ungated by default) -------------------
         loss_txt = agreement_linguistic_kd_loss(
-            student_feats   = outputs["hidden_features"],
-            aligned_nlp     = outputs["aligned_nlp"],
-            clip_img_feats  = outputs["clip_img_feats"],
-            frozen_nlp_feats= outputs["frozen_nlp_feats"],
-            w               = w,
-            temperature     = self.temperature,
-            logit_scale     = self.logit_scale,
+            student_feats=outputs["hidden_features"],
+            aligned_nlp=outputs["aligned_nlp"],
+            clip_img_feats=outputs["clip_img_feats"],
+            frozen_nlp_feats=outputs["frozen_nlp_feats"],
+            sample_weight=None,
+            temperature=self.temperature,
+            logit_scale=logit_scale,
+        )
+        loss_txt_gated = agreement_linguistic_kd_loss(
+            student_feats=outputs["hidden_features"],
+            aligned_nlp=outputs["aligned_nlp"],
+            clip_img_feats=outputs["clip_img_feats"],
+            frozen_nlp_feats=outputs["frozen_nlp_feats"],
+            sample_weight=w,
+            temperature=self.temperature,
+            logit_scale=logit_scale,
         )
 
         # ---- 5. Geometry preservation --------------------------------
-        # Applied to student_shared (unconstrained CCA space) rather than
-        # hidden_features (L2-normalized), because the unit-variance target
-        # conflicts with L2 normalization (per-dim variance ≈ 1/d on the sphere).
         loss_geom = self.geo_loss(outputs["student_shared"])
 
         # ---- 6. Feature-wise distillation (NanoSD-inspired) ----------
@@ -257,24 +264,25 @@ class AACDCriterion:
 
         # ---- Total ---------------------------------------------------
         total = (
-            cls_w    * loss_cls
+            cls_w * loss_cls
             + kd_scale * self.lambda_shared * loss_shared
-            + kd_scale * self.lambda_vis    * loss_vis
-            + kd_scale * self.lambda_txt    * loss_txt
-            +            self.lambda_geom   * loss_geom
-            + kd_scale * self.lambda_feat   * loss_feat
+            + kd_scale * self.lambda_vis * loss_vis
+            + kd_scale * self.lambda_txt * loss_txt
+            + self.lambda_geom * loss_geom
+            + kd_scale * self.lambda_feat * loss_feat
         )
 
         return {
-            "total":          total,
-            "cls":            loss_cls.item(),
-            "shared":         loss_shared.item(),
-            "vis":            loss_vis.item(),
-            "txt":            loss_txt.item(),
-            "geom":           loss_geom.item(),
-            "feat":           loss_feat.item() if torch.is_tensor(loss_feat) else loss_feat,
+            "total": total,
+            "cls": loss_cls.item(),
+            "shared": loss_shared.item(),
+            "vis": loss_vis.item(),
+            "txt": loss_txt.item(),
+            "txt_gated": loss_txt_gated.item(),
+            "geom": loss_geom.item(),
+            "feat": loss_feat.item() if torch.is_tensor(loss_feat) else loss_feat,
             "mean_agreement": w.mean().item(),
-            "mean_delta":     outputs["delta"].mean().item(),
-            "cls_w":          cls_w,
-            "kd_scale":       kd_scale,
+            "mean_delta": outputs["delta"].mean().item(),
+            "cls_w": cls_w,
+            "kd_scale": kd_scale,
         }

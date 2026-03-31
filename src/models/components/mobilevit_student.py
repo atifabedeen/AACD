@@ -4,7 +4,7 @@ MobileViT student backbone with patch token access.
 Wraps timm's MobileViT to expose:
   * Patch tokens from the final stage (for semantic-aware aggregation)
   * Intermediate stage features (for feature-wise distillation)
-  * Global features + logits (for classification)
+  * GAP features for debugging/ablation
 """
 
 from __future__ import annotations
@@ -48,8 +48,12 @@ class MobileViTStudent(nn.Module):
         # Final-stage channels = student feature dimension
         self.num_features: int = self.stage_dims[-1]
 
-        # Classification head (replaces timm's removed head)
+        # Classification head. AACD applies it to the aggregated features.
         self.classifier = nn.Linear(self.num_features, num_classes)
+
+    def classify(self, features: torch.Tensor) -> torch.Tensor:
+        """Apply the student classifier to a global feature representation."""
+        return self.classifier(features)
 
     def forward(
         self, x: torch.Tensor,
@@ -61,24 +65,25 @@ class MobileViTStudent(nn.Module):
 
         Returns
         -------
-        patch_tokens   : (B, N, D)  spatial tokens from the final stage.
-        global_features: (B, D)     GAP of the final stage.
-        logits         : (B, C)     classification logits.
+        patch_tokens   : (B, N, D) spatial tokens from the final stage.
+        global_features: (B, D) GAP features from the final stage.
+        gap_logits     : (B, C) classification logits from GAP features.
         intermediates  : list[(B, D_l)] GAP features from earlier stages.
         """
         stage_features = self.backbone(x)  # list of (B, C_l, H_l, W_l)
 
-        # ---- Final stage → patch tokens + global -----------------------
+        # ---- Final stage -> patch tokens + GAP ------------------------
         final = stage_features[-1]                       # (B, C, H, W)
         B, C, H, W = final.shape
         patch_tokens = final.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        global_features = final.mean(dim=[2, 3])         # (B, C)
+        global_features = final.mean(dim=[2, 3])        # (B, C)
 
-        logits = self.classifier(global_features)        # (B, num_classes)
+        # Retained for debugging/ablation; AACD uses classify(hidden_features).
+        gap_logits = self.classify(global_features)     # (B, num_classes)
 
-        # ---- Intermediate stages → GAP each ----------------------------
+        # ---- Intermediate stages -> GAP each --------------------------
         intermediates = [
             feat.mean(dim=[2, 3]) for feat in stage_features[:-1]
         ]
 
-        return patch_tokens, global_features, logits, intermediates
+        return patch_tokens, global_features, gap_logits, intermediates

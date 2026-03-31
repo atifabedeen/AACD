@@ -22,15 +22,14 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Tuple
 
-import numpy as np
 import torch
 from lightning import LightningModule
 from torch.utils.data import DataLoader
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 
-from src.models.components.cca_module import CCAProjection
 from src.models.components.aacd_criterion import AACDCriterion
+from src.models.components.cca_module import CCAProjection
 
 
 class AACDModule(LightningModule):
@@ -45,7 +44,7 @@ class AACDModule(LightningModule):
     kd_criterion : AACDCriterion instance.
     cca_s        : Number of CCA shared dimensions (must match net.agreement.shared_dim).
     cca_tau      : Correlation threshold for auto-detecting s (used if cca_s=0).
-    cache_dir    : Directory to cache extracted features.  Defaults to CWD.
+    cache_dir    : Directory to cache extracted features. Defaults to CWD.
     compile      : Whether to torch.compile the model.
     """
 
@@ -78,20 +77,24 @@ class AACDModule(LightningModule):
         num_classes = self.net.data_attributes.class_num
 
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        self.val_acc   = Accuracy(task="multiclass", num_classes=num_classes)
-        self.test_acc  = Accuracy(task="multiclass", num_classes=num_classes)
+        self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
+        self.test_acc = Accuracy(task="multiclass", num_classes=num_classes)
 
         self.train_loss = MeanMetric()
-        self.val_loss   = MeanMetric()
-        self.test_loss  = MeanMetric()
+        self.val_loss = MeanMetric()
+        self.test_loss = MeanMetric()
 
         # Extra AACD-specific metrics
-        self.kd_loss     = MeanMetric()
-        self.cls_loss    = MeanMetric()
+        self.kd_loss = MeanMetric()
+        self.cls_loss = MeanMetric()
         self.shared_loss = MeanMetric()
-        self.geom_loss   = MeanMetric()
-        self.feat_loss   = MeanMetric()
-        self.mean_agree  = MeanMetric()
+        self.geom_loss = MeanMetric()
+        self.feat_loss = MeanMetric()
+        self.mean_agree = MeanMetric()
+        self.mean_delta = MeanMetric()
+        self.txt_loss = MeanMetric()
+        self.txt_gated_loss = MeanMetric()
+        self.patch_entropy = MeanMetric()
 
         self.val_acc_best = MaxMetric()
 
@@ -107,7 +110,7 @@ class AACDModule(LightningModule):
             self._initialize_agreement()
         elif stage == "test":
             # During eval from checkpoint, _A/_B/prototypes/_initialized_flag
-            # are restored as registered buffers.  Verify they loaded correctly.
+            # are restored as registered buffers. Verify they loaded correctly.
             if not self.net.agreement._initialized:
                 raise RuntimeError(
                     "AgreementModule was not initialized after loading checkpoint. "
@@ -134,7 +137,7 @@ class AACDModule(LightningModule):
             dino_feats = cached["dino"]
             labels_all = cached["labels"]
         else:
-            print("[AACD] Extracting teacher features for CCA fitting …")
+            print("[AACD] Extracting teacher features for CCA fitting ...")
             clip_feats, dino_feats, labels_all = self._extract_features(
                 dm, device
             )
@@ -216,8 +219,8 @@ class AACDModule(LightningModule):
         raw_dataset.transform = orig_transform
 
         return (
-            torch.cat(all_clip,   dim=0),
-            torch.cat(all_dino,   dim=0),
+            torch.cat(all_clip, dim=0),
+            torch.cat(all_dino, dim=0),
             torch.cat(all_labels, dim=0),
         )
 
@@ -243,14 +246,21 @@ class AACDModule(LightningModule):
             max_epochs=self.trainer.max_epochs,
         )
         preds = torch.argmax(outputs["logits"], dim=1)
-        return loss_dict, preds, y
+        return loss_dict, preds, y, outputs
+
+    @staticmethod
+    def _module_grad_norm(module: torch.nn.Module) -> torch.Tensor | None:
+        grads = [p.grad.detach().norm(2) for p in module.parameters() if p.grad is not None]
+        if not grads:
+            return None
+        return torch.stack(grads).norm(2)
 
     # ------------------------------------------------------------------
     # Training / validation / test steps
     # ------------------------------------------------------------------
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
-        loss_dict, preds, targets = self.model_step(batch)
+        loss_dict, preds, targets, outputs = self.model_step(batch)
         loss = loss_dict["total"]
 
         self.train_loss(loss)
@@ -261,26 +271,48 @@ class AACDModule(LightningModule):
         self.geom_loss(loss_dict["geom"])
         self.feat_loss(loss_dict["feat"])
         self.mean_agree(loss_dict["mean_agreement"])
+        self.mean_delta(loss_dict["mean_delta"])
+        self.txt_loss(loss_dict["txt"])
+        self.txt_gated_loss(loss_dict["txt_gated"])
+        self.patch_entropy(outputs["patch_entropy"])
 
-        self.log("train/loss",   self.train_loss,  on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/acc",    self.train_acc,   on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/cls",    self.cls_loss,    on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/cls", self.cls_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/shared", self.shared_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/kd",     self.kd_loss,     on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/geom",   self.geom_loss,   on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/feat",   self.feat_loss,   on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/agree",  self.mean_agree,  on_step=False, on_epoch=True, prog_bar=False)
+        self.log("train/kd", self.kd_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/txt", self.txt_loss, on_step=False, on_epoch=True, prog_bar=False)
+        self.log("train/txt_gated", self.txt_gated_loss, on_step=False, on_epoch=True, prog_bar=False)
+        self.log("train/geom", self.geom_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/feat", self.feat_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/agree", self.mean_agree, on_step=False, on_epoch=True, prog_bar=False)
+        self.log("train/delta", self.mean_delta, on_step=False, on_epoch=True, prog_bar=False)
+        self.log("train/patch_entropy", self.patch_entropy, on_step=False, on_epoch=True, prog_bar=False)
         return loss
+
+    def on_after_backward(self) -> None:
+        if not getattr(self.net, "use_mobilevit", False):
+            return
+
+        classifier_grad = self._module_grad_norm(self.net.student.classifier)
+        if classifier_grad is not None:
+            self.log("train/grad_classifier", classifier_grad, on_step=True, on_epoch=False, prog_bar=False)
+
+        patch_agg = getattr(self.net, "patch_agg", None)
+        if patch_agg is not None:
+            patch_grad = self._module_grad_norm(patch_agg)
+            if patch_grad is not None:
+                self.log("train/grad_patchagg", patch_grad, on_step=True, on_epoch=False, prog_bar=False)
 
     def on_train_epoch_end(self) -> None:
         pass
 
     def validation_step(self, batch, batch_idx: int) -> None:
-        loss_dict, preds, targets = self.model_step(batch)
+        loss_dict, preds, targets, _outputs = self.model_step(batch)
         self.val_loss(loss_dict["total"])
         self.val_acc(preds, targets)
         self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/acc",  self.val_acc,  on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
 
     def on_validation_epoch_end(self) -> None:
         acc = self.val_acc.compute()
@@ -288,11 +320,11 @@ class AACDModule(LightningModule):
         self.log("val/acc_best", self.val_acc_best.compute(), sync_dist=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx: int) -> None:
-        loss_dict, preds, targets = self.model_step(batch)
+        loss_dict, preds, targets, _outputs = self.model_step(batch)
         self.test_loss(loss_dict["total"])
         self.test_acc(preds, targets)
         self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("test/acc",  self.test_acc,  on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
 
     def on_test_epoch_end(self) -> None:
         pass
@@ -304,7 +336,7 @@ class AACDModule(LightningModule):
     def configure_optimizers(self) -> Dict[str, Any]:
         # Only train student + alignment layers; teachers are frozen
         trainable_params = [
-            p for name, p in self.net.named_parameters()
+            p for _name, p in self.net.named_parameters()
             if p.requires_grad
         ]
         optimizer = self.optimizer_factory(params=trainable_params)

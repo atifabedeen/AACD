@@ -38,7 +38,7 @@ class AACDTeacherStudent(nn.Module):
                      Must match what CCAProjection.s produces; set via config.
     agreement_alpha: Temperature alpha for w = exp(-alpha*delta).
     use_mobilevit  : If True, use MobileViT student with patch aggregation
-                     and feature-wise distillation.  If False, use ResNet
+                     and feature-wise distillation. If False, use ResNet
                      student (original AACD behaviour).
     """
 
@@ -61,13 +61,13 @@ class AACDTeacherStudent(nn.Module):
 
         # ---- DINOv2 teacher (frozen) ---------------------------------
         self.dino_teacher = DINOv2Teacher(dino.model_name)
-        dino_dim = self.dino_teacher.output_dim           # e.g. 384/768/...
+        dino_dim = self.dino_teacher.output_dim          # e.g. 384/768/...
 
-        # ---- Student -------------------------------------------------
+        # ---- Student --------------------------------------------------
         if use_mobilevit:
+            from src.models.components.feature_distillation import FeatureWiseDistillation
             from src.models.components.mobilevit_student import MobileViTStudent
             from src.models.components.patch_aggregation import SemanticAwareAggregation
-            from src.models.components.feature_distillation import FeatureWiseDistillation
 
             self.student = MobileViTStudent(
                 arch=student.arch,
@@ -109,7 +109,6 @@ class AACDTeacherStudent(nn.Module):
         )
 
         # ---- Shared-space condensation layer -------------------------
-        # Projects student features -> CCA shared space for agreement-distillation
         self.condensation_shared = nn.Sequential(
             nn.Linear(student_dim, student_dim),
             nn.ReLU(),
@@ -138,6 +137,13 @@ class AACDTeacherStudent(nn.Module):
         nlp_feats = self.clip_teacher.encode_text(tokens).detach()
         return feature_norm(nlp_feats)
 
+    def _get_clip_logit_scale(self, device: torch.device) -> torch.Tensor:
+        """Read the frozen CLIP logit scale from the instantiated teacher."""
+        logit_scale = getattr(self.clip_teacher.model, "logit_scale", None)
+        if logit_scale is None:
+            return torch.tensor(1.0 / 0.07, device=device)
+        return logit_scale.detach().exp().to(device)
+
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> dict:
         """
@@ -162,26 +168,31 @@ class AACDTeacherStudent(nn.Module):
           delta                  (B,)              - per-sample disagreement
           projected_intermediates list[(B, shared_dim)] or None
         """
-        # ---- Teacher forward (no grad) --------------------------------
+        # ---- Teacher forward (no grad) -------------------------------
         clip_img = self.clip_teacher(x)           # normed, (B, clip_dim)
         dino_img = self.dino_teacher(x)           # normed, (B, dino_dim)
 
         frozen_nlp = self.frozen_nlp_features.to(x.device)   # (C, clip_dim)
 
         # ---- Alignment layers ----------------------------------------
-        aligned_img  = feature_norm(self.align_img(clip_img))    # (B, student_dim)
-        aligned_nlp  = feature_norm(self.align_nlp(frozen_nlp))  # (C, student_dim)
-        aligned_dino = feature_norm(self.align_dino(dino_img))   # (B, student_dim)
+        aligned_img = feature_norm(self.align_img(clip_img))      # (B, student_dim)
+        aligned_nlp = feature_norm(self.align_nlp(frozen_nlp))    # (C, student_dim)
+        aligned_dino = feature_norm(self.align_dino(dino_img))    # (B, student_dim)
 
         # ---- Student forward -----------------------------------------
         projected_intermediates = None
+        gap_features = None
+        gap_logits = None
+        patch_entropy = torch.tensor(0.0, device=x.device)
 
         if self.use_mobilevit:
-            patch_tokens, global_feats, logits, intermediates = self.student(x)
+            patch_tokens, gap_features, gap_logits, intermediates = self.student(x)
 
             # Semantic-aware aggregation (SS5.9)
-            aggregated, _attn_weights = self.patch_agg(patch_tokens)
+            aggregated, attn_weights = self.patch_agg(patch_tokens)
             hidden_features = feature_norm(aggregated)
+            logits = self.student.classify(hidden_features)
+            patch_entropy = -(attn_weights * (attn_weights + 1e-10).log()).sum(dim=1).mean()
 
             # Feature-wise distillation projections (SS5.11)
             projected_intermediates = self.feat_distill.project(intermediates)
@@ -194,27 +205,30 @@ class AACDTeacherStudent(nn.Module):
                 clip_img.detach(), dino_img.detach()
             )
         else:
-            # Fallback before agreement is initialized (e.g. sanity check)
-            B = x.size(0)
-            w = torch.ones(B, device=x.device)
-            z_shared = torch.zeros(B, self.agreement.shared_dim, device=x.device)
-            delta = torch.zeros(B, device=x.device)
+            batch_size = x.size(0)
+            w = torch.ones(batch_size, device=x.device)
+            z_shared = torch.zeros(batch_size, self.agreement.shared_dim, device=x.device)
+            delta = torch.zeros(batch_size, device=x.device)
 
         # ---- Student condensation to shared space --------------------
         student_shared = self.condensation_shared(hidden_features)   # (B, shared_dim)
 
         return {
-            "hidden_features":        hidden_features,
-            "logits":                 logits,
-            "clip_img_feats":         clip_img,
-            "dino_img_feats":         dino_img,
-            "frozen_nlp_feats":       frozen_nlp,
-            "aligned_img":            aligned_img,
-            "aligned_dino":           aligned_dino,
-            "aligned_nlp":            aligned_nlp,
-            "student_shared":         student_shared,
-            "shared_target":          z_shared.detach(),
-            "agreement_w":            w.detach(),
-            "delta":                  delta.detach(),
+            "hidden_features": hidden_features,
+            "logits": logits,
+            "clip_img_feats": clip_img,
+            "dino_img_feats": dino_img,
+            "frozen_nlp_feats": frozen_nlp,
+            "aligned_img": aligned_img,
+            "aligned_dino": aligned_dino,
+            "aligned_nlp": aligned_nlp,
+            "student_shared": student_shared,
+            "shared_target": z_shared.detach(),
+            "agreement_w": w.detach(),
+            "delta": delta.detach(),
             "projected_intermediates": projected_intermediates,
+            "clip_logit_scale": self._get_clip_logit_scale(x.device),
+            "patch_entropy": patch_entropy.detach(),
+            "gap_features": gap_features,
+            "gap_logits": gap_logits,
         }

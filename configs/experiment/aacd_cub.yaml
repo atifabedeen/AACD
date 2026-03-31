@@ -34,5 +34,5 @@ model:
     shared_dim: 256
     agreement_alpha: 2.0
   kd_criterion:
-    lambda_feat: 0.15
+    lambda_feat: 0.0
   cca_s: 256

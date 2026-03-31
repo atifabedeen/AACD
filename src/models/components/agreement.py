@@ -19,7 +19,8 @@ After fitting CCAProjection on training features, call:
 
     module.initialize(cca, clip_feats_np, dino_feats_np, labels_np)
 
-This stores A, B as plain tensors and builds per-class prototypes.
+This stores A, B and the training-set means as registered buffers
+and builds per-class prototypes.
 """
 
 from __future__ import annotations
@@ -48,10 +49,13 @@ class AgreementModule(nn.Module):
         self.shared_dim = shared_dim
         self.alpha = alpha
 
-        # Projection matrices stored as buffers so they persist in checkpoints.
-        # Placeholder shapes; replaced by initialize() once CCA is fitted.
-        self.register_buffer("_A", torch.zeros(shared_dim, 1))   # (s, dim_c)
-        self.register_buffer("_B", torch.zeros(shared_dim, 1))   # (s, dim_d)
+        # Projection matrices and training-set means stored as buffers so
+        # they persist in checkpoints.  Placeholder shapes; replaced by
+        # initialize() once CCA is fitted.
+        self.register_buffer("_A", torch.zeros(shared_dim, 1))       # (s, dim_c)
+        self.register_buffer("_B", torch.zeros(shared_dim, 1))       # (s, dim_d)
+        self.register_buffer("_mean_c", torch.zeros(1))              # (dim_c,)
+        self.register_buffer("_mean_d", torch.zeros(1))              # (dim_d,)
 
         # Class prototypes in the shared CCA space (L2-normalised).
         self.register_buffer(
@@ -85,19 +89,23 @@ class AgreementModule(nn.Module):
 
         device = self.prototypes.device
 
-        # Store projection matrices as buffers (persist in checkpoint)
+        # Store projection matrices and training-set means as buffers
         A = torch.tensor(cca.A_s, dtype=torch.float32).to(device)  # (s, dim_c)
         B = torch.tensor(cca.B_s, dtype=torch.float32).to(device)  # (s, dim_d)
+        mean_c = torch.tensor(cca.mean_c, dtype=torch.float32).to(device)  # (dim_c,)
+        mean_d = torch.tensor(cca.mean_d, dtype=torch.float32).to(device)  # (dim_d,)
         self._A.data = A
         self._B.data = B
+        self._mean_c.data = mean_c
+        self._mean_d.data = mean_d
 
         clip_feats = clip_feats.float().to(device)
         dino_feats = dino_feats.float().to(device)
         labels = labels.long().to(device)
 
-        # Project all training features
-        clip_proj = clip_feats @ A.T   # (N, s)
-        dino_proj = dino_feats @ B.T   # (N, s)
+        # Centre then project (CCA was fitted on centred features)
+        clip_proj = (clip_feats - mean_c) @ A.T   # (N, s)
+        dino_proj = (dino_feats - mean_d) @ B.T   # (N, s)
         shared = 0.5 * (clip_proj + dino_proj)  # (N, s)
 
         # Compute per-class mean → prototype
@@ -144,9 +152,9 @@ class AgreementModule(nn.Module):
         A = self._A   # buffer, already on correct device
         B = self._B
 
-        # Project to shared CCA space
-        clip_proj = clip_feats @ A.T   # (B, s)
-        dino_proj = dino_feats @ B.T   # (B, s)
+        # Centre then project (CCA was fitted on centred features)
+        clip_proj = (clip_feats - self._mean_c) @ A.T   # (B, s)
+        dino_proj = (dino_feats - self._mean_d) @ B.T   # (B, s)
 
         # Normalise for cosine similarity
         clip_n = F.normalize(clip_proj, dim=1)

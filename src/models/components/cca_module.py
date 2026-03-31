@@ -19,11 +19,19 @@ where A ∈ ℝ^{s×dim_c}, B ∈ ℝ^{s×dim_d}.
 from __future__ import annotations
 
 import numpy as np
-from scipy.linalg import sqrtm, inv
 
 
 class CCAProjection:
     """Offline CCA solver that stores projection matrices A and B."""
+
+    @staticmethod
+    def _inv_sqrt_psd(matrix: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+        """Stable inverse square root for symmetric PSD matrices."""
+        matrix = 0.5 * (matrix + matrix.T)
+        eigvals, eigvecs = np.linalg.eigh(matrix)
+        eigvals = np.clip(eigvals, a_min=eps, a_max=None)
+        inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+        return 0.5 * (inv_sqrt + inv_sqrt.T)
 
     def __init__(
         self,
@@ -53,9 +61,11 @@ class CCAProjection:
         self.reg = reg
 
         # Filled by fit()
-        self.A: np.ndarray | None = None    # (s, dim_c)
-        self.B: np.ndarray | None = None    # (s, dim_d)
-        self.rho: np.ndarray | None = None  # (r,) descending correlation coefficients
+        self.A: np.ndarray | None = None      # (s, dim_c)
+        self.B: np.ndarray | None = None      # (s, dim_d)
+        self.mean_c: np.ndarray | None = None # (dim_c,) training-set CLIP mean
+        self.mean_d: np.ndarray | None = None # (dim_d,) training-set DINOv2 mean
+        self.rho: np.ndarray | None = None    # (r,) descending correlation coefficients
         self.fitted: bool = False
 
     # ------------------------------------------------------------------
@@ -73,8 +83,10 @@ class CCAProjection:
         N = Z_clip.shape[0]
 
         # ---- 1. Centre -----------------------------------------------
-        Z_c = Z_clip - Z_clip.mean(axis=0, keepdims=True)
-        Z_d = Z_dino - Z_dino.mean(axis=0, keepdims=True)
+        self.mean_c = Z_clip.mean(axis=0)   # (dim_c,)
+        self.mean_d = Z_dino.mean(axis=0)   # (dim_d,)
+        Z_c = Z_clip - self.mean_c[None, :]
+        Z_d = Z_dino - self.mean_d[None, :]
 
         # ---- 2. Covariance matrices (with regularisation) ------------
         Sigma_cc = Z_c.T @ Z_c / N + self.reg * np.eye(self.dim_c)
@@ -82,8 +94,8 @@ class CCAProjection:
         Sigma_cd = Z_c.T @ Z_d / N   # (dim_c, dim_d)
 
         # ---- 3. Whitening --------------------------------------------
-        Scc_inv_sqrt = inv(sqrtm(Sigma_cc)).real
-        Sdd_inv_sqrt = inv(sqrtm(Sigma_dd)).real
+        Scc_inv_sqrt = self._inv_sqrt_psd(Sigma_cc)
+        Sdd_inv_sqrt = self._inv_sqrt_psd(Sigma_dd)
 
         # ---- 4. SVD of whitened cross-covariance ---------------------
         #   M = Scc^{-1/2} Σ_{cd} Sdd^{-1/2}  →  U S Vt
@@ -132,3 +144,17 @@ class CCAProjection:
     def rho_s(self) -> np.ndarray:
         """Top-s canonical correlations."""
         return self.rho[: self.s]
+
+    def project_clip(self, Z_clip: np.ndarray) -> np.ndarray:
+        """Project CLIP features using the training-set centering from fit()."""
+        assert self.fitted, "CCAProjection must be fitted before projection."
+        Z_clip = Z_clip.astype(np.float64)
+        centered = Z_clip - self.mean_c[None, :]
+        return centered @ self.A_s.T
+
+    def project_dino(self, Z_dino: np.ndarray) -> np.ndarray:
+        """Project DINOv2 features using the training-set centering from fit()."""
+        assert self.fitted, "CCAProjection must be fitted before projection."
+        Z_dino = Z_dino.astype(np.float64)
+        centered = Z_dino - self.mean_d[None, :]
+        return centered @ self.B_s.T
