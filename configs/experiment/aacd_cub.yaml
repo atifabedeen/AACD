@@ -1,0 +1,38 @@
+# @package _global_
+
+# to execute this experiment run:
+#   python src/train.py experiment=aacd_cub
+#
+# to use ResNet-18 student instead of MobileViT:
+#   python src/train.py experiment=aacd_cub model.net.use_mobilevit=false model.net.student.arch=resnet18
+
+defaults:
+  - override /model: aacd
+  - override /data: kd_data
+  - override /callbacks: default
+  - override /trainer: ddp
+
+tags: ["aacd", "cub200", "mobilevit"]
+
+seed: 42
+
+trainer:
+  max_epochs: 100
+
+data:
+  attributes:
+    name: 0_CUB_200_2011
+  batch_size: 256
+
+model:
+  net:
+    student:
+      arch: mobilevit_s
+    dino:
+      model_name: dinov2_vits14
+    use_mobilevit: true
+    shared_dim: 256
+    agreement_alpha: 2.0
+  kd_criterion:
+    lambda_feat: 0.15
+  cca_s: 256

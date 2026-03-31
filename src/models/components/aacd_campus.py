@@ -5,7 +5,9 @@ Extends VL2Lite's TeacherStudent with:
   * A second frozen teacher: DINOv2
   * CCA-based shared feature space between the two teachers
   * Per-sample agreement weighting
-  * A condensation layer mapping student → shared CCA space
+  * A condensation layer mapping student -> shared CCA space
+  * (Optional) MobileViT student with semantic-aware patch aggregation
+  * (Optional) Feature-wise multi-scale distillation (NanoSD-inspired)
 
 Forward output is a dict consumed by AACDCriterion.
 """
@@ -30,11 +32,14 @@ class AACDTeacherStudent(nn.Module):
     ----------
     teacher        : Namespace with .arch and .pretrained (for CLIP, same as VL2Lite).
     dino           : Namespace with .model_name (e.g. 'dinov2_vits14').
-    student        : Namespace with .arch (e.g. 'resnet18').
+    student        : Namespace with .arch (e.g. 'resnet18' or 'mobilevit_s').
     data_attributes: Dataset attributes namespace (class_num, prompt_tmpl, classes).
     shared_dim     : Dimensionality of the CCA shared space (= s).
                      Must match what CCAProjection.s produces; set via config.
-    agreement_alpha: Temperature α for w = exp(-α·Δ).
+    agreement_alpha: Temperature alpha for w = exp(-alpha*delta).
+    use_mobilevit  : If True, use MobileViT student with patch aggregation
+                     and feature-wise distillation.  If False, use ResNet
+                     student (original AACD behaviour).
     """
 
     def __init__(
@@ -45,8 +50,10 @@ class AACDTeacherStudent(nn.Module):
         data_attributes,
         shared_dim: int = 256,
         agreement_alpha: float = 2.0,
+        use_mobilevit: bool = False,
     ):
         super().__init__()
+        self.use_mobilevit = use_mobilevit
 
         # ---- CLIP teacher (frozen) -----------------------------------
         self.clip_teacher = TeacherNet(teacher)
@@ -54,11 +61,35 @@ class AACDTeacherStudent(nn.Module):
 
         # ---- DINOv2 teacher (frozen) ---------------------------------
         self.dino_teacher = DINOv2Teacher(dino.model_name)
-        dino_dim = self.dino_teacher.output_dim           # e.g. 384/768/…
+        dino_dim = self.dino_teacher.output_dim           # e.g. 384/768/...
 
         # ---- Student -------------------------------------------------
-        self.student = StudentNet(student, data_attributes.class_num, use_teacher=True)
-        student_dim = self.student.num_features           # e.g. 512 for ResNet-18
+        if use_mobilevit:
+            from src.models.components.mobilevit_student import MobileViTStudent
+            from src.models.components.patch_aggregation import SemanticAwareAggregation
+            from src.models.components.feature_distillation import FeatureWiseDistillation
+
+            self.student = MobileViTStudent(
+                arch=student.arch,
+                num_classes=data_attributes.class_num,
+            )
+            student_dim = self.student.num_features
+
+            # Semantic-aware patch aggregation (SS5.9)
+            self.patch_agg = SemanticAwareAggregation(student_dim)
+
+            # Feature-wise distillation projectors (SS5.11)
+            self.feat_distill = FeatureWiseDistillation(
+                student_dims=self.student.stage_dims[:-1],
+                target_dim=shared_dim,
+            )
+        else:
+            self.student = StudentNet(
+                student, data_attributes.class_num, use_teacher=True,
+            )
+            student_dim = self.student.num_features
+            self.patch_agg = None
+            self.feat_distill = None
 
         # ---- VL2Lite alignment layers (image + text) ----------------
         self.align_img = nn.Sequential(
@@ -73,7 +104,7 @@ class AACDTeacherStudent(nn.Module):
         )
 
         # ---- Shared-space condensation layer -------------------------
-        # Projects student features → CCA shared space for agreement-distillation
+        # Projects student features -> CCA shared space for agreement-distillation
         self.condensation_shared = nn.Sequential(
             nn.Linear(student_dim, student_dim),
             nn.ReLU(),
@@ -112,17 +143,18 @@ class AACDTeacherStudent(nn.Module):
         Returns
         -------
         dict with keys:
-          hidden_features  (B, student_dim)  – L2-normed student repr
-          logits           (B, num_classes)
-          clip_img_feats   (B, clip_dim)     – normed CLIP image feats
-          dino_img_feats   (B, dino_dim)     – normed DINOv2 feats
-          frozen_nlp_feats (C, clip_dim)     – text embeddings
-          aligned_img      (B, student_dim)  – condensed CLIP img feats
-          aligned_nlp      (C, student_dim)  – condensed text feats
-          student_shared   (B, shared_dim)   – student in CCA space
-          shared_target    (B, shared_dim)   – CCA avg signal (detached)
-          agreement_w      (B,)              – per-sample agreement weights
-          delta            (B,)              – per-sample disagreement
+          hidden_features        (B, student_dim)  - L2-normed student repr
+          logits                 (B, num_classes)
+          clip_img_feats         (B, clip_dim)     - normed CLIP image feats
+          dino_img_feats         (B, dino_dim)     - normed DINOv2 feats
+          frozen_nlp_feats       (C, clip_dim)     - text embeddings
+          aligned_img            (B, student_dim)  - condensed CLIP img feats
+          aligned_nlp            (C, student_dim)  - condensed text feats
+          student_shared         (B, shared_dim)   - student in CCA space
+          shared_target          (B, shared_dim)   - CCA avg signal (detached)
+          agreement_w            (B,)              - per-sample agreement weights
+          delta                  (B,)              - per-sample disagreement
+          projected_intermediates list[(B, shared_dim)] or None
         """
         # ---- Teacher forward (no grad) --------------------------------
         clip_img = self.clip_teacher(x)           # normed, (B, clip_dim)
@@ -135,7 +167,19 @@ class AACDTeacherStudent(nn.Module):
         aligned_nlp = feature_norm(self.align_nlp(frozen_nlp)) # (C, student_dim)
 
         # ---- Student forward -----------------------------------------
-        hidden_features, logits = self.student(x)   # (B, d_s), (B, C)
+        projected_intermediates = None
+
+        if self.use_mobilevit:
+            patch_tokens, global_feats, logits, intermediates = self.student(x)
+
+            # Semantic-aware aggregation (SS5.9)
+            aggregated, _attn_weights = self.patch_agg(patch_tokens)
+            hidden_features = feature_norm(aggregated)
+
+            # Feature-wise distillation projections (SS5.11)
+            projected_intermediates = self.feat_distill.project(intermediates)
+        else:
+            hidden_features, logits = self.student(x)   # (B, d_s), (B, C)
 
         # ---- Agreement computation -----------------------------------
         if self.agreement._initialized:
@@ -153,15 +197,16 @@ class AACDTeacherStudent(nn.Module):
         student_shared = self.condensation_shared(hidden_features)   # (B, shared_dim)
 
         return {
-            "hidden_features": hidden_features,
-            "logits":          logits,
-            "clip_img_feats":  clip_img,
-            "dino_img_feats":  dino_img,
-            "frozen_nlp_feats": frozen_nlp,
-            "aligned_img":     aligned_img,
-            "aligned_nlp":     aligned_nlp,
-            "student_shared":  student_shared,
-            "shared_target":   z_shared.detach(),
-            "agreement_w":     w.detach(),
-            "delta":           delta.detach(),
+            "hidden_features":        hidden_features,
+            "logits":                 logits,
+            "clip_img_feats":         clip_img,
+            "dino_img_feats":         dino_img,
+            "frozen_nlp_feats":       frozen_nlp,
+            "aligned_img":            aligned_img,
+            "aligned_nlp":            aligned_nlp,
+            "student_shared":         student_shared,
+            "shared_target":          z_shared.detach(),
+            "agreement_w":            w.detach(),
+            "delta":                  delta.detach(),
+            "projected_intermediates": projected_intermediates,
         }

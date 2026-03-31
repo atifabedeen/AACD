@@ -32,8 +32,10 @@ net:
     model_name: dinov2_vits14
 
   # Student
+  # MobileViT: mobilevit_s / mobilevit_xs / mobilevit_xxs
+  # ResNet:    resnet18 (set use_mobilevit: false)
   student:
-    arch: resnet18
+    arch: mobilevit_s
 
   # Dataset attributes injected automatically
   data_attributes: ${data.train_dataset.attributes}
@@ -43,8 +45,12 @@ net:
   shared_dim: 256
 
   # Agreement temperature  w = exp(-alpha * delta)
-  # Larger  →  stricter filtering of disagreed samples.
+  # Larger  ->  stricter filtering of disagreed samples.
   agreement_alpha: 2.0
+
+  # Enable MobileViT student with patch aggregation + feature-wise distillation.
+  # Set to false to fall back to ResNet student (original behaviour).
+  use_mobilevit: true
 
 # ---- AACD loss --------------------------------------------------------
 kd_criterion:
@@ -55,6 +61,7 @@ kd_criterion:
   lambda_vis:     0.2    # agreement-weighted visual KD (L1, CLIP)
   lambda_txt:     0.2    # agreement-weighted linguistic KD (KL, CLIP text)
   lambda_geom:    0.1    # geometry preservation (AE-SVC)
+  lambda_feat:    0.15   # agreement-weighted feature-wise distillation (NanoSD)
   class_num: ${data.train_dataset.attributes.class_num}
 
 # ---- CCA settings (used in AACDModule.setup) -------------------------

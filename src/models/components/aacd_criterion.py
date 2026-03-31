@@ -1,16 +1,17 @@
 """
 AACD combined loss function.
 
-Total loss (proposal §6):
+Total loss (proposal SS6):
 
-  L = λ_cls · L_cls
-    + kd_scale · λ_shared  · L_shared   (agreement-weighted CCA distillation)
-    + kd_scale · λ_vis     · L_vis      (RKD on CLIP image features)
-    + kd_scale · λ_txt     · L_txt      (KL on CLIP text-similarity distribution)
-    + λ_geom                · L_geom    (AE-SVC geometry constraint)
+  L = cls_w   * L_cls
+    + kd_scale * lambda_shared * L_shared   (agreement-weighted CCA distillation)
+    + kd_scale * lambda_vis    * L_vis      (RKD on CLIP image features)
+    + kd_scale * lambda_txt    * L_txt      (KL on CLIP text-similarity distribution)
+    + lambda_geom              * L_geom     (AE-SVC geometry constraint)
+    + kd_scale * lambda_feat   * L_feat     (agreement-weighted feature-wise distillation)
 
-Dynamic weighting follows VL2Lite (§3.5):
-  - L_cls weight grows from near-0 → 1 over training
+Dynamic weighting follows VL2Lite (SS3.5):
+  - L_cls weight grows from near-0 -> 1 over training
   - KD losses scale down by 0.5 over training
   This lets the student first learn from teachers, then refine with labels.
 """
@@ -36,7 +37,7 @@ class GeometryPreservationLoss(nn.Module):
 
     Adapted from AE-SVC (Omama et al., ICLR 2025).
 
-    Weights follow the AE-SVC paper: λ_cov=1, λ_var=15, λ_mean=1.
+    Weights follow the AE-SVC paper: lambda_cov=1, lambda_var=15, lambda_mean=1.
     """
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -45,14 +46,14 @@ class GeometryPreservationLoss(nn.Module):
         z_c = z - z.mean(dim=0, keepdim=True)         # centred
         cov = (z_c.T @ z_c) / B                        # (d, d)
 
-        # Off-diagonal covariance → 0
+        # Off-diagonal covariance -> 0
         eye = torch.eye(d, device=z.device)
         loss_cov  = torch.norm(cov - eye, p="fro") ** 2
 
-        # Diagonal (variance) → 1
+        # Diagonal (variance) -> 1
         loss_var  = ((cov.diagonal() - 1.0) ** 2).mean()
 
-        # Mean → 0
+        # Mean -> 0
         loss_mean = (z.mean(dim=0) ** 2).mean()
 
         return 1.0 * loss_cov + 15.0 * loss_var + 1.0 * loss_mean
@@ -125,6 +126,26 @@ def agreement_linguistic_kd_loss(
 
 
 # ---------------------------------------------------------------------------
+# Sub-loss: agreement-weighted feature-wise distillation (NanoSD-inspired)
+# ---------------------------------------------------------------------------
+
+def feature_wise_loss(
+    projected_intermediates: list[torch.Tensor],   # list of (B, shared_dim)
+    shared_target: torch.Tensor,                   # (B, shared_dim)
+    w: torch.Tensor,                               # (B,)
+) -> torch.Tensor:
+    """
+    L1 between each projected student intermediate feature and the CCA
+    shared signal, weighted by agreement.  Averaged over scales.
+    """
+    total = torch.tensor(0.0, device=shared_target.device)
+    for proj_feat in projected_intermediates:
+        per_sample = (proj_feat - shared_target).abs().mean(dim=1)   # (B,)
+        total = total + (w * per_sample).mean()
+    return total / max(len(projected_intermediates), 1)
+
+
+# ---------------------------------------------------------------------------
 # Combined AACD criterion
 # ---------------------------------------------------------------------------
 
@@ -143,6 +164,7 @@ class AACDCriterion:
         lambda_vis: float = 0.2,
         lambda_txt: float = 0.2,
         lambda_geom: float = 0.1,
+        lambda_feat: float = 0.15,
         class_num: int = 200,
     ):
         self.temperature  = temperature
@@ -151,6 +173,7 @@ class AACDCriterion:
         self.lambda_vis   = lambda_vis
         self.lambda_txt   = lambda_txt
         self.lambda_geom  = lambda_geom
+        self.lambda_feat  = lambda_feat
         self.class_num    = class_num
 
         self.ce = nn.CrossEntropyLoss()
@@ -176,10 +199,10 @@ class AACDCriterion:
         epoch      : current training epoch (0-based)
         max_epochs : total training epochs
         """
-        # ---- Dynamic weight scheduling (VL2Lite §3.5) ---------------
+        # ---- Dynamic weight scheduling (VL2Lite SS3.5) ---------------
         progress  = epoch / max(max_epochs, 1)
         cls_w     = self.lambda_cls + progress * (1.0 - self.lambda_cls)
-        kd_scale  = 1.0 - progress * 0.5          # 1.0 → 0.5 over training
+        kd_scale  = 1.0 - progress * 0.5          # 1.0 -> 0.5 over training
 
         w = outputs["agreement_w"]   # (B,)
 
@@ -214,6 +237,17 @@ class AACDCriterion:
         # ---- 5. Geometry preservation --------------------------------
         loss_geom = self.geo_loss(outputs["hidden_features"])
 
+        # ---- 6. Feature-wise distillation (NanoSD-inspired) ----------
+        proj_inter = outputs.get("projected_intermediates")
+        if proj_inter is not None:
+            loss_feat = feature_wise_loss(
+                proj_inter,
+                outputs["shared_target"],
+                w,
+            )
+        else:
+            loss_feat = torch.tensor(0.0, device=loss_cls.device)
+
         # ---- Total ---------------------------------------------------
         total = (
             cls_w    * loss_cls
@@ -221,6 +255,7 @@ class AACDCriterion:
             + kd_scale * self.lambda_vis    * loss_vis
             + kd_scale * self.lambda_txt    * loss_txt
             +            self.lambda_geom   * loss_geom
+            + kd_scale * self.lambda_feat   * loss_feat
         )
 
         return {
@@ -230,6 +265,7 @@ class AACDCriterion:
             "vis":            loss_vis.item(),
             "txt":            loss_txt.item(),
             "geom":           loss_geom.item(),
+            "feat":           loss_feat.item() if torch.is_tensor(loss_feat) else loss_feat,
             "mean_agreement": w.mean().item(),
             "mean_delta":     outputs["delta"].mean().item(),
             "cls_w":          cls_w,

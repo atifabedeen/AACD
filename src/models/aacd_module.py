@@ -90,6 +90,7 @@ class AACDModule(LightningModule):
         self.cls_loss    = MeanMetric()
         self.shared_loss = MeanMetric()
         self.geom_loss   = MeanMetric()
+        self.feat_loss   = MeanMetric()
         self.mean_agree  = MeanMetric()
 
         self.val_acc_best = MaxMetric()
@@ -250,6 +251,7 @@ class AACDModule(LightningModule):
         self.shared_loss(loss_dict["shared"])
         self.kd_loss(loss_dict["vis"] + loss_dict["txt"])
         self.geom_loss(loss_dict["geom"])
+        self.feat_loss(loss_dict["feat"])
         self.mean_agree(loss_dict["mean_agreement"])
 
         self.log("train/loss",   self.train_loss,  on_step=False, on_epoch=True, prog_bar=True)
@@ -258,6 +260,7 @@ class AACDModule(LightningModule):
         self.log("train/shared", self.shared_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/kd",     self.kd_loss,     on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/geom",   self.geom_loss,   on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/feat",   self.feat_loss,   on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/agree",  self.mean_agree,  on_step=False, on_epoch=True, prog_bar=False)
         return loss
 
