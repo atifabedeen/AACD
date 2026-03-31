@@ -48,16 +48,24 @@ class AgreementModule(nn.Module):
         self.shared_dim = shared_dim
         self.alpha = alpha
 
-        # Projection matrices (set by initialize(); kept as plain tensors,
-        # not parameters, so they don't accumulate gradients).
-        self._A: torch.Tensor | None = None   # (s, dim_c)
-        self._B: torch.Tensor | None = None   # (s, dim_d)
+        # Projection matrices stored as buffers so they persist in checkpoints.
+        # Placeholder shapes; replaced by initialize() once CCA is fitted.
+        self.register_buffer("_A", torch.zeros(shared_dim, 1))   # (s, dim_c)
+        self.register_buffer("_B", torch.zeros(shared_dim, 1))   # (s, dim_d)
 
         # Class prototypes in the shared CCA space (L2-normalised).
         self.register_buffer(
             "prototypes", torch.zeros(num_classes, shared_dim)
         )
-        self._initialized: bool = False
+
+        # Track initialization state as a 1-element buffer so it survives checkpoint save/load.
+        self.register_buffer(
+            "_initialized_flag", torch.tensor(0, dtype=torch.bool)
+        )
+
+    @property
+    def _initialized(self) -> bool:
+        return bool(self._initialized_flag.item())
 
     # ------------------------------------------------------------------
     def initialize(
@@ -77,11 +85,11 @@ class AgreementModule(nn.Module):
 
         device = self.prototypes.device
 
-        # Store projection matrices on the module's device
+        # Store projection matrices as buffers (persist in checkpoint)
         A = torch.tensor(cca.A_s, dtype=torch.float32).to(device)  # (s, dim_c)
         B = torch.tensor(cca.B_s, dtype=torch.float32).to(device)  # (s, dim_d)
-        self._A = A
-        self._B = B
+        self._A.data = A
+        self._B.data = B
 
         clip_feats = clip_feats.float().to(device)
         dino_feats = dino_feats.float().to(device)
@@ -101,7 +109,7 @@ class AgreementModule(nn.Module):
 
         # L2-normalise prototypes
         self.prototypes.data = F.normalize(prototypes, dim=1)
-        self._initialized = True
+        self._initialized_flag.fill_(True)
         print(
             f"[AgreementModule] Initialized  classes={self.num_classes}  "
             f"shared_dim={self.shared_dim}  alpha={self.alpha}"
@@ -133,8 +141,8 @@ class AgreementModule(nn.Module):
         """
         self._check_initialized()
 
-        A = self._A.to(clip_feats.device)
-        B = self._B.to(dino_feats.device)
+        A = self._A   # buffer, already on correct device
+        B = self._B
 
         # Project to shared CCA space
         clip_proj = clip_feats @ A.T   # (B, s)

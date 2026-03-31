@@ -33,6 +33,11 @@ class DINOv2Teacher(nn.Module):
         self.model.eval()
         self.output_dim = getattr(self.model, "num_features", getattr(self.model, "embed_dim"))
 
+    def train(self, mode: bool = True):
+        # Keep frozen teacher permanently in eval mode
+        super().train(False)
+        return self
+
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns normalized global features (B, output_dim)."""

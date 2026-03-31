@@ -46,12 +46,12 @@ class GeometryPreservationLoss(nn.Module):
         z_c = z - z.mean(dim=0, keepdim=True)         # centred
         cov = (z_c.T @ z_c) / B                        # (d, d)
 
-        # Off-diagonal covariance -> 0
-        eye = torch.eye(d, device=z.device)
-        loss_cov  = torch.norm(cov - eye, p="fro") ** 2
+        # Off-diagonal covariance -> 0  (exclude diagonal to avoid double-counting with loss_var)
+        off_diag_mask = ~torch.eye(d, dtype=torch.bool, device=z.device)
+        loss_cov = (cov[off_diag_mask] ** 2).sum() / d
 
         # Diagonal (variance) -> 1
-        loss_var  = ((cov.diagonal() - 1.0) ** 2).mean()
+        loss_var = ((cov.diagonal() - 1.0) ** 2).mean()
 
         # Mean -> 0
         loss_mean = (z.mean(dim=0) ** 2).mean()

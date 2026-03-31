@@ -105,6 +105,14 @@ class AACDModule(LightningModule):
 
         if stage == "fit":
             self._initialize_agreement()
+        elif stage == "test":
+            # During eval from checkpoint, _A/_B/prototypes/_initialized_flag
+            # are restored as registered buffers.  Verify they loaded correctly.
+            if not self.net.agreement._initialized:
+                raise RuntimeError(
+                    "AgreementModule was not initialized after loading checkpoint. "
+                    "Ensure the checkpoint was saved from a trained AACD model."
+                )
 
     def _initialize_agreement(self) -> None:
         """Extract features, fit CCA, initialize AgreementModule."""

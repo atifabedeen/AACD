@@ -46,6 +46,11 @@ class TeacherNet(nn.Module):
         self.tokenizer = open_clip.get_tokenizer(teacher.arch)
         self.last_features_dim = self.model.transformer.resblocks[-1].mlp.c_proj.out_features
 
+    def train(self, mode: bool = True):
+        # Keep frozen teacher permanently in eval mode
+        super().train(False)
+        return self
+
     def encode_image(self, x):
         return self.model.encode_image(x)
 
