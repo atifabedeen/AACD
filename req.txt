@@ -1,0 +1,24 @@
+# Supplemental runtime requirements for VL2Lite AACD
+# This file includes the repo requirements plus packages imported by the code.
+
+torch>=2.0.0
+torchvision>=0.15.0
+lightning>=2.0.0
+torchmetrics>=0.11.4
+
+hydra-core==1.3.2
+hydra-colorlog==1.2.0
+hydra-optuna-sweeper==1.2.0
+
+rootutils
+rich
+pytest
+
+open-clip-torch
+timm
+pandas
+scipy
+pillow
+
+# Optional: use this only if you want the default W&B logger without overriding logger=csv
+# wandb

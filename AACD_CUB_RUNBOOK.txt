@@ -1,0 +1,186 @@
+VL2Lite AACD Runbook (Clone -> Dataset -> Cache -> Train)
+
+Repository
+- GitHub: https://github.com/jsjangAI/VL2Lite
+- Local repo root after clone: /workspace/projects/VL2Lite
+
+1. Clone the repository
+
+```bash
+git clone https://github.com/jsjangAI/VL2Lite.git
+cd VL2Lite
+```
+
+2. Create the environment
+
+Option A: conda from the repo environment file
+
+```bash
+conda env create -f environment.yaml
+conda activate myenv
+```
+
+Then install the runtime packages actually used by the code:
+
+```bash
+pip install -r req.txt
+pip install -e .
+```
+
+Option B: manual environment
+
+```bash
+conda create -n vl2lite python=3.10 -y
+conda activate vl2lite
+pip install -r req.txt
+pip install -e .
+```
+
+Notes
+- The repo already has a requirements.txt, but it does not include every runtime dependency used by AACD.
+- The req.txt in this repo includes the extra packages imported by the code, such as open-clip-torch, timm, pandas, scipy, and pillow.
+
+3. Download the exact CUB-200-2011 dataset
+
+Official dataset page
+- https://www.vision.caltech.edu/datasets/cub_200_2011/
+
+Official file record
+- https://data.caltech.edu/records/65de6-vp158
+
+Download the file named:
+- CUB_200_2011.tgz
+
+4. Put the dataset where this repo expects it
+
+From the repo root:
+
+```bash
+mkdir -p data/kd_datasets
+mv /path/to/CUB_200_2011.tgz data/kd_datasets/
+cd data/kd_datasets
+tar -xzf CUB_200_2011.tgz
+cd ../..
+```
+
+After extraction, this directory should exist:
+
+```text
+data/kd_datasets/CUB_200_2011/
+```
+
+Expected files inside that folder include:
+- images/
+- images.txt
+- image_class_labels.txt
+- train_test_split.txt
+
+Important path note
+- The default Hydra config uses the dataset name 0_CUB_200_2011.
+- The loader in this repo can resolve either of these folders:
+  - data/kd_datasets/0_CUB_200_2011/
+  - data/kd_datasets/CUB_200_2011/
+- So the default extracted folder name CUB_200_2011 is fine.
+
+5. Precompute the AACD teacher-feature cache
+
+This step creates the cache used to fit CCA and initialize the agreement module.
+It is strongly recommended before training.
+
+From the repo root:
+
+```bash
+python scripts/extract_teacher_features.py \
+  --data_name 0_CUB_200_2011 \
+  --data_root data/kd_datasets/0_CUB_200_2011 \
+  --clip_arch convnext_xxlarge \
+  --clip_ckpt laion2b_s34b_b82k_augreg_soup \
+  --dino_model dinov2_vits14 \
+  --out_dir .cache \
+  --batch_size 256 \
+  --device cuda
+```
+
+This should create:
+
+```text
+.cache/aacd_features_0_CUB_200_2011.pth
+```
+
+Why this matters
+- AACD uses cached CLIP image features, DINO image features, and labels for the full training set.
+- These are used to fit CCA and build class prototypes for the agreement module.
+
+6. Train AACD on a single GPU (recommended first run)
+
+Use CSV logging to avoid a required W&B login.
+
+```bash
+python src/train.py experiment=aacd_cub trainer=gpu logger=csv
+```
+
+7. Train AACD on 2 GPUs
+
+Only do this after the cache already exists.
+The current AACD setup initializes agreement state inside setup("fit"), so multi-process startup is safer when the cache is already present.
+
+```bash
+python src/train.py experiment=aacd_cub trainer=ddp trainer.devices=2 logger=csv
+```
+
+8. Useful overrides
+
+Use ResNet-18 instead of MobileViT:
+
+```bash
+python src/train.py experiment=aacd_cub trainer=gpu logger=csv \
+  model.net.use_mobilevit=false model.net.student.arch=resnet18
+```
+
+Use a smaller DINOv2 teacher for debugging:
+
+```bash
+python src/train.py   experiment=aacd_cub   data.attributes.name=0_CUB_200_2011   trainer=ddp   trainer.devices=2   trainer.max_epochs=200   trainer.check_val_every_n_epoch=10   model.net.use_mobilevit=true   model.net.student.arch=mobilevit_s   model.net.dino.model_name=dinov2_vits14   data.batch_size=32
+```
+
+9. Outputs
+
+Training outputs are written under Hydra log directories, typically under:
+
+```text
+logs/
+```
+
+10. Common failure points
+
+- Missing dataset files: check that CUB_200_2011 was extracted and contains images.txt, image_class_labels.txt, train_test_split.txt, and images/.
+- Missing cache: run the extract_teacher_features.py command before training.
+- W&B login prompt: use logger=csv.
+- Multi-GPU first run: precompute the cache first, then launch DDP.
+- Checkpoint reload issue: this repo has already been patched locally for the agreement-module checkpoint-loading bug.
+
+11. Minimal command sequence
+
+```bash
+git clone https://github.com/jsjangAI/VL2Lite.git
+cd VL2Lite
+conda env create -f environment.yaml
+conda activate myenv
+pip install -r req.txt
+pip install -e .
+mkdir -p data/kd_datasets
+# download CUB_200_2011.tgz from the official CaltechDATA page into data/kd_datasets/
+cd data/kd_datasets
+tar -xzf CUB_200_2011.tgz
+cd ../..
+python scripts/extract_teacher_features.py \
+  --data_name 0_CUB_200_2011 \
+  --data_root data/kd_datasets/0_CUB_200_2011 \
+  --clip_arch convnext_xxlarge \
+  --clip_ckpt laion2b_s34b_b82k_augreg_soup \
+  --dino_model dinov2_vits14 \
+  --out_dir .cache \
+  --batch_size 256 \
+  --device cuda
+python src/train.py   experiment=aacd_cub   data.attributes.name=0_CUB_200_2011   trainer=ddp   trainer.devices=2   trainer.max_epochs=200   trainer.check_val_every_n_epoch=10   model.net.use_mobilevit=true   model.net.student.arch=mobilevit_s   model.net.dino.model_name=dinov2_vits14   data.batch_size=32
+```
