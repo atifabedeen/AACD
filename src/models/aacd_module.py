@@ -1,20 +1,5 @@
 """
 AACD Lightning module.
-
-Extends VL2Lite's KDModule with:
-  1. DINOv2 as a second frozen teacher.
-  2. CCA fitting + agreement-module initialization in setup().
-  3. Agreement-weighted, geometry-preserving AACD loss.
-
-CCA setup flow
---------------
-  setup("fit") is called once per process before the first training step.
-  It:
-    a) Creates a clean (no-augmentation) DataLoader over the training set.
-    b) Extracts CLIP + DINOv2 features for every training sample.
-    c) Fits CCAProjection.
-    d) Calls AgreementModule.initialize() to build class prototypes.
-    e) Caches features to <cache_dir>/aacd_features.pth so re-runs are fast.
 """
 
 from __future__ import annotations
@@ -33,21 +18,6 @@ from src.models.components.cca_module import CCAProjection
 
 
 class AACDModule(LightningModule):
-    """
-    Lightning module for Agreement-Aware Correlation-Guided Distillation.
-
-    Parameters
-    ----------
-    net          : AACDTeacherStudent instance (from Hydra config).
-    optimizer    : Partial optimizer constructor.
-    scheduler    : Partial LR-scheduler constructor (or None).
-    kd_criterion : AACDCriterion instance.
-    cca_s        : Number of CCA shared dimensions (must match net.agreement.shared_dim).
-    cca_tau      : Correlation threshold for auto-detecting s (used if cca_s=0).
-    cache_dir    : Directory to cache extracted features. Defaults to CWD.
-    compile      : Whether to torch.compile the model.
-    """
-
     def __init__(
         self,
         net: torch.nn.Module,
@@ -55,13 +25,13 @@ class AACDModule(LightningModule):
         scheduler: torch.optim.lr_scheduler,
         kd_criterion: AACDCriterion,
         use_teacher: bool = True,
-        cca_s: int = 256,
+        cca_s: int = 128,
         cca_tau: float = 0.1,
-        cache_dir: str = ".",
+        cache_dir: str = '.',
         compile: bool = False,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(ignore=["net", "optimizer", "scheduler", "kd_criterion"], logger=False)
+        self.save_hyperparameters(ignore=['net', 'optimizer', 'scheduler', 'kd_criterion'], logger=False)
 
         self.net = net
         self.optimizer_factory = optimizer
@@ -74,121 +44,84 @@ class AACDModule(LightningModule):
         self.cca_tau = cca_tau
         self.cache_dir = cache_dir
 
-        num_classes = self.net.data_attributes.class_num
-
-        self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        self.test_acc = Accuracy(task="multiclass", num_classes=num_classes)
-
+        num_classes = self._aacd_net.data_attributes.class_num
+        self.train_acc = Accuracy(task='multiclass', num_classes=num_classes)
+        self.val_acc = Accuracy(task='multiclass', num_classes=num_classes)
+        self.test_acc = Accuracy(task='multiclass', num_classes=num_classes)
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.test_loss = MeanMetric()
-
-        # Extra AACD-specific metrics
-        self.kd_loss = MeanMetric()
         self.cls_loss = MeanMetric()
         self.shared_loss = MeanMetric()
+        self.kd_loss = MeanMetric()
         self.geom_loss = MeanMetric()
         self.feat_loss = MeanMetric()
-        self.mean_agree = MeanMetric()
-        self.mean_delta = MeanMetric()
         self.txt_loss = MeanMetric()
-        self.txt_gated_loss = MeanMetric()
         self.patch_entropy = MeanMetric()
-
         self.val_acc_best = MaxMetric()
 
-    # ------------------------------------------------------------------
-    # Setup: CCA fitting
-    # ------------------------------------------------------------------
+    @property
+    def _aacd_net(self):
+        return getattr(self.net, '_orig_mod', self.net)
 
     def setup(self, stage: str) -> None:
-        if self.compile_model and stage == "fit":
+        if self.compile_model and stage == 'fit':
             self.net = torch.compile(self.net)
 
-        if stage == "fit":
+        if stage == 'fit':
             self._initialize_agreement()
-        elif stage == "test":
-            # During eval from checkpoint, _A/_B/prototypes/_initialized_flag
-            # are restored as registered buffers. Verify they loaded correctly.
-            if not self.net.agreement._initialized:
-                raise RuntimeError(
-                    "AgreementModule was not initialized after loading checkpoint. "
-                    "Ensure the checkpoint was saved from a trained AACD model."
-                )
+        elif stage == 'test' and not self._aacd_net.agreement._initialized:
+            raise RuntimeError(
+                'AgreementModule was not initialized after loading checkpoint. '
+                'Ensure the checkpoint was saved from a trained AACD model.'
+            )
 
     def _initialize_agreement(self) -> None:
-        """Extract features, fit CCA, initialize AgreementModule."""
         dm = self.trainer.datamodule
-        data_name = dm.hparams.attributes.name   # e.g. "0_CUB_200_2011"
+        data_name = dm.hparams.attributes.name
         device = self.device
+        net = self._aacd_net
 
         os.makedirs(self.cache_dir, exist_ok=True)
-        cache_path = os.path.join(
-            self.cache_dir,
-            f"aacd_features_{data_name}.pth",
-        )
+        cache_path = os.path.join(self.cache_dir, f'aacd_features_v2_{data_name}.pth')
 
-        # ---- Feature extraction (or load from cache) -----------------
         if os.path.exists(cache_path):
-            print(f"[AACD] Loading cached teacher features from {cache_path}")
-            cached = torch.load(cache_path, map_location="cpu")
-            clip_feats = cached["clip"]
-            dino_feats = cached["dino"]
-            labels_all = cached["labels"]
+            print(f'[AACD] Loading cached teacher features from {cache_path}')
+            cached = torch.load(cache_path, map_location='cpu')
+            clip_feats = cached['clip']
+            dino_feats = cached['dino']
+            labels_all = cached['labels']
         else:
-            print("[AACD] Extracting teacher features for CCA fitting ...")
-            clip_feats, dino_feats, labels_all = self._extract_features(
-                dm, device
-            )
-            torch.save(
-                {"clip": clip_feats, "dino": dino_feats, "labels": labels_all},
-                cache_path,
-            )
-            print(f"[AACD] Cached features saved to {cache_path}")
+            print('[AACD] Extracting teacher features for CCA fitting ...')
+            clip_feats, dino_feats, labels_all = self._extract_features(dm, device)
+            torch.save({'clip': clip_feats, 'dino': dino_feats, 'labels': labels_all}, cache_path)
+            print(f'[AACD] Cached features saved to {cache_path}')
 
-        # ---- CCA fitting ---------------------------------------------
         clip_dim = clip_feats.shape[1]
         dino_dim = dino_feats.shape[1]
         s = self.cca_s if self.cca_s > 0 else None
-
         cca = CCAProjection(dim_c=clip_dim, dim_d=dino_dim, s=s, tau=self.cca_tau)
         cca.fit(clip_feats.numpy(), dino_feats.numpy())
 
-        # Safety check: shared_dim in agreement module must match cca.s
-        assert self.net.agreement.shared_dim == cca.s, (
-            f"AgreementModule.shared_dim={self.net.agreement.shared_dim} "
-            f"!= cca.s={cca.s}. Set cca_s={cca.s} in the config."
+        assert net.agreement.shared_dim == cca.s, (
+            f'AgreementModule.shared_dim={net.agreement.shared_dim} '
+            f'!= cca.s={cca.s}. Set cca_s={cca.s} in the config.'
         )
-
-        # ---- Agreement module initialization -------------------------
-        self.net.agreement.initialize(cca, clip_feats, dino_feats, labels_all)
-        print("[AACD] Agreement module initialized.")
+        net.agreement.initialize(cca, clip_feats, dino_feats, labels_all)
+        print('[AACD] Agreement module initialized.')
 
     @torch.no_grad()
     def _extract_features(
         self, dm, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Build a no-augmentation loader and extract CLIP + DINOv2 features.
-
-        ``dm.data_train`` is the raw underlying dataset (e.g. CUB200Dataset).
-        We temporarily swap its transform to a clean test-style transform so
-        there is no augmentation during feature extraction.
-        """
         from torchvision import transforms as T
 
-        normalize = T.Normalize(
-            mean=[0.48145466, 0.4578275, 0.40821073],
-            std=[0.26862954, 0.26130258, 0.27577711],
-        )
         clean_transform = T.Compose([
             T.Resize((224, 224)),
             T.ToTensor(),
-            normalize,
         ])
 
-        raw_dataset = dm.data_train  # underlying CUBDataset / etc.
+        raw_dataset = dm.data_train
         orig_transform = raw_dataset.transform
         raw_dataset.transform = clean_transform
 
@@ -200,33 +133,30 @@ class AACDModule(LightningModule):
             pin_memory=True,
         )
 
-        clip_teacher = self.net.clip_teacher.to(device)
-        dino_teacher = self.net.dino_teacher.to(device)
+        net = self._aacd_net
+        clip_teacher = net.clip_teacher.to(device)
+        dino_teacher = net.dino_teacher.to(device)
 
         all_clip, all_dino, all_labels = [], [], []
         n = len(loader)
         for i, (images, labels_batch) in enumerate(loader, 1):
             images = images.to(device)
-            clip_f = clip_teacher(images)
-            dino_f = dino_teacher(images)
+            clip_inputs = net.preprocess_for_clip(images)
+            dino_inputs = net.preprocess_for_imagenet(images)
+            clip_f = clip_teacher(clip_inputs)
+            dino_f = dino_teacher(dino_inputs)
             all_clip.append(clip_f.cpu())
             all_dino.append(dino_f.cpu())
             all_labels.append(labels_batch)
             if i % 20 == 0 or i == n:
-                print(f"  [extract] batch {i}/{n}", flush=True)
+                print(f'  [extract] batch {i}/{n}', flush=True)
 
-        # Restore original transform
         raw_dataset.transform = orig_transform
-
         return (
             torch.cat(all_clip, dim=0),
             torch.cat(all_dino, dim=0),
             torch.cat(all_labels, dim=0),
         )
-
-    # ------------------------------------------------------------------
-    # Core training logic
-    # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> dict:
         return self.net(x)
@@ -245,7 +175,7 @@ class AACDModule(LightningModule):
             epoch=self.current_epoch,
             max_epochs=self.trainer.max_epochs,
         )
-        preds = torch.argmax(outputs["logits"], dim=1)
+        preds = torch.argmax(outputs['logits'], dim=1)
         return loss_dict, preds, y, outputs
 
     @staticmethod
@@ -255,86 +185,91 @@ class AACDModule(LightningModule):
             return None
         return torch.stack(grads).norm(2)
 
-    # ------------------------------------------------------------------
-    # Training / validation / test steps
-    # ------------------------------------------------------------------
+    def _log_aux(self, prefix: str, loss_dict: dict, outputs: dict) -> None:
+        self.log(f'{prefix}/agree', loss_dict['agreement_rate'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/delta', loss_dict['mean_delta'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/clip_margin', loss_dict['mean_clip_margin'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/dino_margin', loss_dict['mean_dino_margin'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/shared_full', loss_dict['full_shared_frac'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/shared_soft', loss_dict['soft_shared_frac'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/label_only', loss_dict['label_only_frac'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/text_weight', loss_dict['mean_text_kd_weight'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/patch_entropy', outputs['patch_entropy'], on_step=False, on_epoch=True, prog_bar=False)
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         loss_dict, preds, targets, outputs = self.model_step(batch)
-        loss = loss_dict["total"]
+        loss = loss_dict['total']
 
         self.train_loss(loss)
         self.train_acc(preds, targets)
-        self.cls_loss(loss_dict["cls"])
-        self.shared_loss(loss_dict["shared"])
-        self.kd_loss(loss_dict["vis"] + loss_dict["txt"])
-        self.geom_loss(loss_dict["geom"])
-        self.feat_loss(loss_dict["feat"])
-        self.mean_agree(loss_dict["mean_agreement"])
-        self.mean_delta(loss_dict["mean_delta"])
-        self.txt_loss(loss_dict["txt"])
-        self.txt_gated_loss(loss_dict["txt_gated"])
-        self.patch_entropy(outputs["patch_entropy"])
+        self.cls_loss(loss_dict['cls'])
+        self.shared_loss(loss_dict['shared'])
+        self.kd_loss(loss_dict['shared'] + loss_dict['txt'])
+        self.geom_loss(loss_dict['geom'])
+        self.feat_loss(loss_dict['feat'])
+        self.txt_loss(loss_dict['txt'])
+        self.patch_entropy(outputs['patch_entropy'])
 
-        self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/cls", self.cls_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/shared", self.shared_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/kd", self.kd_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/txt", self.txt_loss, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train/txt_gated", self.txt_gated_loss, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train/geom", self.geom_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/feat", self.feat_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/agree", self.mean_agree, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train/delta", self.mean_delta, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train/patch_entropy", self.patch_entropy, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train/loss', self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/acc', self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/cls', self.cls_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/shared', self.shared_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/kd', self.kd_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/txt', self.txt_loss, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train/txt_raw', loss_dict['txt_raw'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train/geom', self.geom_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/feat', self.feat_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self._log_aux('train', loss_dict, outputs)
         return loss
 
     def on_after_backward(self) -> None:
-        if not getattr(self.net, "use_mobilevit", False):
+        if not getattr(self._aacd_net, 'use_mobilevit', False):
             return
 
-        classifier_grad = self._module_grad_norm(self.net.student.classifier)
+        classifier_grad = self._module_grad_norm(self._aacd_net.student.classifier)
         if classifier_grad is not None:
-            self.log("train/grad_classifier", classifier_grad, on_step=True, on_epoch=False, prog_bar=False)
+            self.log('train/grad_classifier', classifier_grad, on_step=True, on_epoch=False, prog_bar=False)
 
-        patch_agg = getattr(self.net, "patch_agg", None)
+        patch_agg = getattr(self._aacd_net, 'patch_agg', None)
         if patch_agg is not None:
             patch_grad = self._module_grad_norm(patch_agg)
             if patch_grad is not None:
-                self.log("train/grad_patchagg", patch_grad, on_step=True, on_epoch=False, prog_bar=False)
+                self.log('train/grad_patchagg', patch_grad, on_step=True, on_epoch=False, prog_bar=False)
 
     def on_train_epoch_end(self) -> None:
         pass
 
     def validation_step(self, batch, batch_idx: int) -> None:
-        loss_dict, preds, targets, _outputs = self.model_step(batch)
-        self.val_loss(loss_dict["total"])
+        loss_dict, preds, targets, outputs = self.model_step(batch)
+        self.val_loss(loss_dict['total'])
         self.val_acc(preds, targets)
-        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val/loss', self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val/acc', self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val/shared', loss_dict['shared'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val/txt', loss_dict['txt'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val/txt_raw', loss_dict['txt_raw'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val/geom', loss_dict['geom'], on_step=False, on_epoch=True, prog_bar=False)
+        self._log_aux('val', loss_dict, outputs)
 
     def on_validation_epoch_end(self) -> None:
         acc = self.val_acc.compute()
         self.val_acc_best(acc)
-        self.log("val/acc_best", self.val_acc_best.compute(), sync_dist=True, prog_bar=True)
+        self.log('val/acc_best', self.val_acc_best.compute(), sync_dist=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx: int) -> None:
-        loss_dict, preds, targets, _outputs = self.model_step(batch)
-        self.test_loss(loss_dict["total"])
+        loss_dict, preds, targets, outputs = self.model_step(batch)
+        self.test_loss(loss_dict['total'])
         self.test_acc(preds, targets)
-        self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test/loss', self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test/acc', self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test/shared', loss_dict['shared'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('test/txt', loss_dict['txt'], on_step=False, on_epoch=True, prog_bar=False)
+        self._log_aux('test', loss_dict, outputs)
 
     def on_test_epoch_end(self) -> None:
         pass
 
-    # ------------------------------------------------------------------
-    # Optimizer
-    # ------------------------------------------------------------------
-
     def configure_optimizers(self) -> Dict[str, Any]:
-        # Only train student + alignment layers; teachers are frozen
         trainable_params = [
             p for _name, p in self.net.named_parameters()
             if p.requires_grad
@@ -343,12 +278,12 @@ class AACDModule(LightningModule):
         if self.scheduler_factory is not None:
             scheduler = self.scheduler_factory(optimizer=optimizer)
             return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "monitor": "val/loss",
-                    "interval": "epoch",
-                    "frequency": 1,
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'monitor': 'val/loss',
+                    'interval': 'epoch',
+                    'frequency': 1,
                 },
             }
-        return {"optimizer": optimizer}
+        return {'optimizer': optimizer}

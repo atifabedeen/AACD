@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 
 import torch
 from lightning import LightningDataModule
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset
 
 
 class IndexedDataset(Dataset):
@@ -47,6 +47,7 @@ class KDDataModule(LightningDataModule):
         num_workers: int = 0,
         pin_memory: bool = False,
         split_seed: int = 42,
+        val_ratio: float = 0.10,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["train_dataset", "test_dataset"], logger=False)
@@ -84,36 +85,80 @@ class KDDataModule(LightningDataModule):
         eval_transform = self.test_source.transform
 
         train_augmented = copy.deepcopy(self.train_source.dataloader)
-        test_augmented = copy.deepcopy(self.test_source.dataloader)
         train_eval = copy.deepcopy(self.train_source.dataloader)
         test_eval = copy.deepcopy(self.test_source.dataloader)
 
-        for dataset in (train_augmented, test_augmented):
-            if hasattr(dataset, "transform"):
-                dataset.transform = train_transform
-
+        if hasattr(train_augmented, "transform"):
+            train_augmented.transform = train_transform
         for dataset in (train_eval, test_eval):
             if hasattr(dataset, "transform"):
                 dataset.transform = eval_transform
 
-        augmented_full = ConcatDataset([train_augmented, test_augmented])
-        eval_full = ConcatDataset([train_eval, test_eval])
+        train_labels = self._extract_labels(train_eval)
+        train_indices, val_indices = self._stratified_train_val_split(
+            train_labels,
+            val_ratio=self.hparams.val_ratio,
+            seed=self.hparams.split_seed,
+        )
+        test_indices = list(range(len(test_eval)))
 
-        total_size = len(eval_full)
-        train_size = int(total_size * 0.70)
-        val_size = int(total_size * 0.15)
-        test_size = total_size - train_size - val_size
+        self.data_train = IndexedDataset(train_augmented, train_indices, self.attributes)
+        self.data_val = IndexedDataset(train_eval, val_indices, self.attributes)
+        self.data_test = IndexedDataset(test_eval, test_indices, self.attributes)
 
-        generator = torch.Generator().manual_seed(self.hparams.split_seed)
-        indices = torch.randperm(total_size, generator=generator).tolist()
+    @staticmethod
+    def _extract_labels(dataset: Dataset) -> list[int]:
+        labels = getattr(dataset, "labels", None)
+        if labels is not None:
+            return [int(label) for label in labels]
 
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:train_size + val_size]
-        test_indices = indices[train_size + val_size:train_size + val_size + test_size]
+        data_frame = getattr(dataset, "data_frame", None)
+        if data_frame is not None:
+            for column in ("ClassId", "label", "labels"):
+                if column in data_frame.columns:
+                    return data_frame[column].astype(int).tolist()
+            if data_frame.shape[1] > 6:
+                return data_frame.iloc[:, 6].astype(int).tolist()
 
-        self.data_train = IndexedDataset(augmented_full, train_indices, self.attributes)
-        self.data_val = IndexedDataset(eval_full, val_indices, self.attributes)
-        self.data_test = IndexedDataset(eval_full, test_indices, self.attributes)
+        return [int(dataset[idx][1]) for idx in range(len(dataset))]
+
+    @staticmethod
+    def _stratified_train_val_split(
+        labels: list[int],
+        val_ratio: float,
+        seed: int,
+    ) -> tuple[list[int], list[int]]:
+        if not 0.0 <= val_ratio < 1.0:
+            raise ValueError(f"val_ratio must be in [0, 1), got {val_ratio}")
+
+        per_class: dict[int, list[int]] = {}
+        for idx, label in enumerate(labels):
+            per_class.setdefault(int(label), []).append(idx)
+
+        generator = torch.Generator().manual_seed(seed)
+        train_indices: list[int] = []
+        val_indices: list[int] = []
+
+        for label in sorted(per_class):
+            label_indices = per_class[label]
+            perm = torch.randperm(len(label_indices), generator=generator).tolist()
+            shuffled = [label_indices[i] for i in perm]
+
+            if len(shuffled) <= 1 or val_ratio == 0.0:
+                n_val = 0
+            else:
+                n_val = int(round(len(shuffled) * val_ratio))
+                n_val = max(n_val, 1)
+                n_val = min(n_val, len(shuffled) - 1)
+
+            val_indices.extend(shuffled[:n_val])
+            train_indices.extend(shuffled[n_val:])
+
+        train_perm = torch.randperm(len(train_indices), generator=generator).tolist()
+        val_perm = torch.randperm(len(val_indices), generator=generator).tolist()
+        train_indices = [train_indices[i] for i in train_perm]
+        val_indices = [val_indices[i] for i in val_perm]
+        return train_indices, val_indices
 
     def train_dataloader(self) -> DataLoader[Any]:
         return DataLoader(

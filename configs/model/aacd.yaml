@@ -35,14 +35,14 @@ net:
   # MobileViT: mobilevit_s / mobilevit_xs / mobilevit_xxs
   # ResNet:    resnet18 (set use_mobilevit: false)
   student:
-    arch: mobilevit_s
+    arch: resnet18
 
   # Dataset attributes injected automatically
   data_attributes: ${data.train_dataset.attributes}
 
   # CCA shared space dimensionality.
   # Must equal cca_s below (set both to the same value).
-  shared_dim: 256
+  shared_dim: 128
 
   # Agreement temperature  w = exp(-alpha * delta)
   # Larger -> stricter filtering of disagreed samples.
@@ -50,7 +50,7 @@ net:
 
   # Enable MobileViT student with patch aggregation + feature-wise distillation.
   # Set to false to fall back to ResNet student (original behaviour).
-  use_mobilevit: true
+  use_mobilevit: false
 
 # ---- AACD loss --------------------------------------------------------
 kd_criterion:
@@ -58,8 +58,7 @@ kd_criterion:
   temperature: 2.0
   lambda_cls: 0.01   # grows to 1.0 dynamically over training
   lambda_shared: 0.3 # agreement-weighted CCA distillation
-  lambda_vis: 0.2    # agreement-weighted visual KD (L1)
-  lambda_txt: 0.2    # CLIP linguistic KD (ungated by default)
+  lambda_txt: 0.2    # CLIP linguistic KD (confidence-gated)
   lambda_geom: 0.1   # existing geometry preservation term
   lambda_feat: 0.0   # experimental multi-scale term disabled by default
   class_num: ${data.train_dataset.attributes.class_num}
@@ -67,7 +66,7 @@ kd_criterion:
 # ---- CCA settings (used in AACDModule.setup) -------------------------
 # cca_s must equal net.shared_dim above.
 # Set cca_s: 0 to let CCA auto-detect s from cca_tau.
-cca_s: 256
+cca_s: 128
 cca_tau: 0.1
 
 # Directory for caching extracted teacher features across runs.

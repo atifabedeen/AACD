@@ -1,38 +1,74 @@
-from pathlib import Path
+from types import SimpleNamespace
 
-import pytest
 import torch
+from torch.utils.data import Dataset
 
-from src.data.kd_datamodule import MNISTDataModule
+from src.data.kd_datamodule import KDDataModule
 
 
-@pytest.mark.parametrize("batch_size", [32, 128])
-def test_mnist_datamodule(batch_size: int) -> None:
-    """Tests `MNISTDataModule` to verify that it can be downloaded correctly, that the necessary
-    attributes were created (e.g., the dataloader objects), and that dtypes and batch sizes
-    correctly match.
+class DummyBaseDataset(Dataset):
+    def __init__(self, labels, transform=None):
+        self.labels = list(labels)
+        self.transform = transform
 
-    :param batch_size: Batch size of the data to be loaded by the dataloader.
-    """
-    data_dir = "data/"
+    def __len__(self):
+        return len(self.labels)
 
-    dm = MNISTDataModule(data_dir=data_dir, batch_size=batch_size)
-    dm.prepare_data()
+    def __getitem__(self, idx):
+        image = torch.tensor([float(idx)], dtype=torch.float32)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, self.labels[idx]
 
-    assert not dm.data_train and not dm.data_val and not dm.data_test
-    assert Path(data_dir, "MNIST").exists()
-    assert Path(data_dir, "MNIST", "raw").exists()
 
+class DummySource:
+    def __init__(self, labels, transform):
+        self.transform = transform
+        self.dataloader = DummyBaseDataset(labels, transform=transform)
+
+
+def test_kd_datamodule_uses_official_train_for_val_and_keeps_test_untouched() -> None:
+    train_labels = [0] * 10 + [1] * 10 + [2] * 10
+    test_labels = [0] * 4 + [1] * 4 + [2] * 4
+    train_transform = lambda x: x + 100.0
+    eval_transform = lambda x: x + 200.0
+    attributes = SimpleNamespace(class_num=3)
+
+    dm = KDDataModule(
+        train_dataset=DummySource(train_labels, train_transform),
+        test_dataset=DummySource(test_labels, eval_transform),
+        attributes=attributes,
+        data_name='dummy',
+        batch_size=4,
+        val_ratio=0.10,
+        split_seed=7,
+    )
     dm.setup()
-    assert dm.data_train and dm.data_val and dm.data_test
-    assert dm.train_dataloader() and dm.val_dataloader() and dm.test_dataloader()
 
-    num_datapoints = len(dm.data_train) + len(dm.data_val) + len(dm.data_test)
-    assert num_datapoints == 70_000
+    assert len(dm.data_train) + len(dm.data_val) == len(train_labels)
+    assert len(dm.data_test) == len(test_labels)
+    assert set(dm.data_train.indices).isdisjoint(set(dm.data_val.indices))
+    assert dm.data_test.indices == list(range(len(test_labels)))
 
-    batch = next(iter(dm.train_dataloader()))
-    x, y = batch
-    assert len(x) == batch_size
-    assert len(y) == batch_size
-    assert x.dtype == torch.float32
-    assert y.dtype == torch.int64
+    val_labels = [train_labels[idx] for idx in dm.data_val.indices]
+    assert set(val_labels) == {0, 1, 2}
+
+    train_item, _ = dm.data_train[0]
+    val_item, _ = dm.data_val[0]
+    test_item, _ = dm.data_test[0]
+    assert train_item.item() >= 100.0
+    assert val_item.item() >= 200.0
+    assert test_item.item() >= 200.0
+
+    dm_same = KDDataModule(
+        train_dataset=DummySource(train_labels, train_transform),
+        test_dataset=DummySource(test_labels, eval_transform),
+        attributes=attributes,
+        data_name='dummy',
+        batch_size=4,
+        val_ratio=0.10,
+        split_seed=7,
+    )
+    dm_same.setup()
+    assert dm.data_train.indices == dm_same.data_train.indices
+    assert dm.data_val.indices == dm_same.data_val.indices

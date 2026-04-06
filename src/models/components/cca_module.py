@@ -116,7 +116,7 @@ class CCAProjection:
         # ---- 6. Choose s ---------------------------------------------
         if self.s is None:
             n_valid = int((self.rho > self.tau).sum())
-            self.s = max(n_valid, 10)
+            self.s = max(n_valid, 128)
         self.s = min(self.s, r)
 
         self.fitted = True

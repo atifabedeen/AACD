@@ -49,32 +49,21 @@ class KDDataset(Dataset):
         return data_root
 
     def get_transform(self, split):
-        normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-            std=[0.26862954, 0.26130258, 0.27577711])       
         if split == 'train':
             return transforms.Compose([
                 transforms.Resize((256, 256)),
-                #transforms.Pad(10),
-                #transforms.Pad(20),
                 transforms.RandomCrop((224, 224)),
-                #transforms.CenterCrop((224, 224)),
                 RandomCropAndResize(min_crop_size=192, max_crop_size=224, final_size=224),
-                transforms.RandomRotation(60, interpolation = PIL.Image.BILINEAR),
+                transforms.RandomRotation(60, interpolation=PIL.Image.BILINEAR),
                 transforms.GaussianBlur(kernel_size=(5, 5), sigma=(0.00001, 10)),
                 transforms.ColorJitter(brightness=.3, contrast=.1, saturation=.1, hue=.1),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize,
-                #transforms.RandomErasing(p=0.5, scale=(0.3, 0.5), ratio=(0.3, 3.3),),
-                ])
-        else:
-            return transforms.Compose([
-                        # transforms.Scale(256),
-                        # transforms.CenterCrop(224),
-                        transforms.Resize((224, 224)),
-                        transforms.ToTensor(),
-                        normalize,
-                    ])
+            ])
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ])
 
     def get_dataloader(self, data_name):
         if data_name == '0_CUB_200_2011':
