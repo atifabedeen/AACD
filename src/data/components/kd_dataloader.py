@@ -51,17 +51,17 @@ class KDDataset(Dataset):
     def get_transform(self, split):
         if split == 'train':
             return transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.RandomCrop((224, 224)),
-                RandomCropAndResize(min_crop_size=192, max_crop_size=224, final_size=224),
-                transforms.RandomRotation(60, interpolation=PIL.Image.BILINEAR),
-                transforms.GaussianBlur(kernel_size=(5, 5), sigma=(0.00001, 10)),
-                transforms.ColorJitter(brightness=.3, contrast=.1, saturation=.1, hue=.1),
+                transforms.RandomResizedCrop(224, scale=(0.4, 1.0), ratio=(0.75, 1.33)),
                 transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(15, interpolation=PIL.Image.BILINEAR),
+                transforms.ColorJitter(brightness=0.3, contrast=0.2, saturation=0.2, hue=0.05),
+                transforms.RandAugment(num_ops=2, magnitude=9),
                 transforms.ToTensor(),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
             ])
         return transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
         ])
 
@@ -230,12 +230,12 @@ class AircraftDataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
 
         assert split in ["train", "test", "val"], "split should be 'train', 'test', or 'val'"
-        
+
         self.root_dir = root_dir
         self.image_paths = []
         self.labels = []
         self.split = split
-        
+
         # 레이블 매핑
         label_map = {}
         with open(os.path.join(root_dir, 'data', 'variants.txt'), 'r') as f:
@@ -243,8 +243,9 @@ class AircraftDataset(Dataset):
                 class_name = line.strip()
                 label_map[class_name] = idx
 
-        # 분할 파일 읽기
-        with open(os.path.join(root_dir, 'data', f'images_variant_{split}.txt'), 'r') as f:
+        # Use trainval for training (standard practice for FGVC Aircraft)
+        file_split = 'trainval' if split == 'train' else split
+        with open(os.path.join(root_dir, 'data', f'images_variant_{file_split}.txt'), 'r') as f:
             for line in f:
                 line_split = line.strip().split(' ')
                 if len(line_split) == 2:

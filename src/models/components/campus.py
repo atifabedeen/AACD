@@ -113,22 +113,23 @@ class StudentNet(nn.Module):
 
 
 class ModifiedResNet(torch.nn.Module):
-    def __init__(self, origin_model, classnum):
+    def __init__(self, origin_model, classnum, dropout: float = 0.3):
         super(ModifiedResNet, self).__init__()
         self.resnet = origin_model
-        
+
         try:
             num_features = origin_model.fc.in_features
             self.resnet.fc = nn.Identity()
         except:
             num_features = origin_model.classifier[1].in_features
-            self.resnet.classifier  = nn.Identity()           
+            self.resnet.classifier  = nn.Identity()
+        self.drop = nn.Dropout(p=dropout)
         self.linear_cls = nn.Linear(num_features, classnum)
         self.num_features = num_features
 
     def forward(self, x):
         hidden_features = self.resnet(x)
-        out = self.linear_cls(hidden_features)
+        out = self.linear_cls(self.drop(hidden_features))
 
         return hidden_features, out
 

@@ -93,7 +93,7 @@ class AACDCriterion:
         self.lambda_geom = lambda_geom
         self.lambda_feat = lambda_feat
         self.class_num = class_num
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.geo_loss = GeometryPreservationLoss()
         self.logit_scale = float(1.0 / 0.07)
 

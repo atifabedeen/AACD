@@ -4,7 +4,7 @@ optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
   lr: 0.0001
-  weight_decay: 0.0
+  weight_decay: 0.01
 
 scheduler:
   _target_: torch.optim.lr_scheduler.StepLR
@@ -56,7 +56,7 @@ net:
 kd_criterion:
   _target_: src.models.components.aacd_criterion.AACDCriterion
   temperature: 2.0
-  lambda_cls: 0.01   # grows to 1.0 dynamically over training
+  lambda_cls: 0.3    # grows to 1.0 dynamically over training
   lambda_shared: 0.3 # agreement-weighted CCA distillation
   lambda_txt: 0.2    # CLIP linguistic KD (confidence-gated)
   lambda_geom: 0.1   # existing geometry preservation term
