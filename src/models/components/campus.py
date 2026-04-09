@@ -6,36 +6,6 @@ import open_clip
 
 feature_norm = lambda x: x / (x.norm(dim=-1, keepdim=True) + 1e-10)
 
-
-class TeacherStudent(nn.Module):
-    def __init__(self, teacher, student, data_attributes, use_teacher=True):
-        super(TeacherStudent, self).__init__()
-        self.teacher, self.align, self.frozen_nlp_features = None, None, None
-        self.data_attributes = data_attributes
-        self.student = StudentNet(student, data_attributes.class_num, use_teacher)
-        if use_teacher:
-            device = next(self.student.model.resnet.parameters()).device
-            self.teacher = TeacherNet(teacher)
-            self.align = AlignNet(self.teacher.last_features_dim, self.student.num_features)
-            self.frozen_nlp_features = self.get_frozen_nlp_features(data_attributes)
-
-    def get_frozen_nlp_features(self, attributes):
-        prompt_tmpl = attributes.prompt_tmpl
-        classes_list = list(attributes.classes.values())
-        text_tokens = self.teacher.tokenizer([prompt_tmpl.format(word) for word in classes_list])
-        nlp_features = self.teacher.encode_text(text_tokens).detach()
-        return feature_norm(nlp_features)
-
-    def forward(self, x):
-        if self.teacher:
-            clip_img_features = self.teacher(x)
-            frozen_nlp_features = self.frozen_nlp_features.to(clip_img_features.device)
-            aligned_img, aligned_nlp = self.align(clip_img_features, frozen_nlp_features)
-            hidden_features, out = self.student(x)
-            return hidden_features, out, clip_img_features, frozen_nlp_features, aligned_img, aligned_nlp
-        return self.student(x)
-
-
 class TeacherNet(nn.Module):
     def __init__(self, teacher):
         super(TeacherNet, self).__init__()
@@ -63,28 +33,6 @@ class TeacherNet(nn.Module):
             clip_img_features = self.encode_image(x).detach()
         clip_img_features = feature_norm(clip_img_features)
         return clip_img_features
-
-
-class AlignNet(nn.Module):
-    def __init__(self, in_features, out_features):
-        super(AlignNet, self).__init__()
-
-        self.align_img_layer = nn.Sequential(
-            nn.Linear(in_features, out_features),
-            nn.ReLU(),
-            nn.Linear(out_features, out_features),
-        )
-        self.align_nlp_layer = nn.Sequential(
-            nn.Linear(in_features, out_features),
-            nn.ReLU(),
-            nn.Linear(out_features, out_features),
-        )
-
-    def forward(self, x, clip_nlp_features):
-        align_img = self.align_img_layer(x)
-        align_nlp = self.align_nlp_layer(clip_nlp_features)
-        return feature_norm(align_img), feature_norm(align_nlp)
-
 
 class StudentNet(nn.Module):
     def __init__(self, student, class_num, use_teacher=True):
@@ -132,6 +80,3 @@ class ModifiedResNet(torch.nn.Module):
         out = self.linear_cls(self.drop(hidden_features))
         return hidden_features, out
 
-
-if __name__ == "__main__":
-    _ = TeacherStudent()

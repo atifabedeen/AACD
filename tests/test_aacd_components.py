@@ -10,7 +10,6 @@ from src.models.components.aacd_criterion import AACDCriterion
 from src.models.components.agreement import AgreementModule
 from src.models.components.cca_module import CCAProjection
 from src.models.components.concept_basis import ConceptBasis
-from src.models.components.patch_aggregation import SemanticAwareAggregation
 
 
 class DummyTeacher(nn.Module):
@@ -68,33 +67,6 @@ class DummyFeatDistill(nn.Module):
         return [torch.zeros(batch_size, self.shared_dim, device=device)]
 
 
-class DummyMobileStudent(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.num_features = 4
-        self.classifier = nn.Linear(4, 3, bias=False)
-        self.last_input = None
-        with torch.no_grad():
-            self.classifier.weight.copy_(torch.tensor([
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ]))
-
-    def classify(self, features: torch.Tensor) -> torch.Tensor:
-        return self.classifier(features)
-
-    def forward(self, x: torch.Tensor):
-        self.last_input = x.detach().clone()
-        batch_size = x.size(0)
-        patch_tokens = torch.tensor(
-            [[[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]]],
-            device=x.device,
-        ).repeat(batch_size, 1, 1)
-        gap_features = torch.zeros(batch_size, 4, device=x.device)
-        gap_logits = -torch.ones(batch_size, 3, device=x.device)
-        intermediates = [torch.ones(batch_size, 3, device=x.device)]
-        return patch_tokens, gap_features, gap_logits, intermediates
 
 
 def _base_outputs(num_concepts: int = 4) -> dict:

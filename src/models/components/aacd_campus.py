@@ -51,26 +51,11 @@ class AACDTeacherStudent(nn.Module):
         self.clip_feature_dim = clip_dim
         self.dino_feature_dim = dino_dim
 
-        if use_mobilevit:
-            from src.models.components.feature_distillation import FeatureWiseDistillation
-            from src.models.components.mobilevit_student import MobileViTStudent
-            from src.models.components.patch_aggregation import SemanticAwareAggregation
 
-            self.student = MobileViTStudent(
-                arch=student.arch,
-                num_classes=data_attributes.class_num,
-            )
-            student_dim = self.student.num_features
-            self.patch_agg = SemanticAwareAggregation(student_dim)
-            self.feat_distill = FeatureWiseDistillation(
-                student_dims=self.student.stage_dims[:-1],
-                target_dim=shared_dim,
-            )
-        else:
-            self.student = StudentNet(student, data_attributes.class_num, use_teacher=True)
-            student_dim = self.student.num_features
-            self.patch_agg = None
-            self.feat_distill = None
+        self.student = StudentNet(student, data_attributes.class_num, use_teacher=True)
+        student_dim = self.student.num_features
+        self.patch_agg = None
+        self.feat_distill = None
 
         self.align_nlp = nn.Sequential(
             nn.Linear(clip_dim, student_dim),
@@ -176,15 +161,8 @@ class AACDTeacherStudent(nn.Module):
         gap_logits = None
         patch_entropy = torch.tensor(0.0, device=x.device)
 
-        if self.use_mobilevit:
-            patch_tokens, gap_features, gap_logits, intermediates = self.student(student_x)
-            aggregated, attn_weights = self.patch_agg(patch_tokens)
-            hidden_features = feature_norm(aggregated)
-            logits = self.student.classify(hidden_features)
-            patch_entropy = -(attn_weights * (attn_weights + 1e-10).log()).sum(dim=1).mean()
-            projected_intermediates = self.feat_distill.project(intermediates)
-        else:
-            hidden_features, logits = self.student(student_x)
+
+        hidden_features, logits = self.student(student_x)
 
         clip_feat = clip_img.detach()
         dino_feat = dino_img.detach()

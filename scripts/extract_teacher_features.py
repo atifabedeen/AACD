@@ -5,19 +5,6 @@ Run this ONCE before starting AACD training to speed up the CCA fitting
 step that happens in AACDModule.setup().  The output .pth file is also
 used by AACDModule when resuming training.
 
-Example
--------
-cd /workspace/projects/VL2Lite
-python scripts/extract_teacher_features.py \
-    --data_name   0_CUB_200_2011 \
-    --data_root   kd_datasets/0_CUB_200_2011 \
-    --clip_arch   convnext_xxlarge \
-    --clip_ckpt   laion2b_s34b_b82k_augreg_soup \
-    --dino_model  dinov2_vits14 \
-    --out_dir     .cache \
-    --batch_size  256 \
-    --device      cuda
-
 For quick debugging use --dino_model dinov2_vits14 (384-dim, fastest).
 For final results use   --dino_model dinov2_vitg14 (1536-dim).
 """

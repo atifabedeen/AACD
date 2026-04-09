@@ -26,7 +26,6 @@ model:
       arch: resnet18
     dino:
       model_name: dinov2_vits14
-    use_mobilevit: false
     shared_dim: 128
     agreement_alpha: 2.0
   kd_criterion:

@@ -4,7 +4,7 @@
 defaults:
   - _self_
   - data: kd_data
-  - model: kda
+  - model: aacd
   - callbacks: default
   - logger: wandb # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
   - trainer: ddp
