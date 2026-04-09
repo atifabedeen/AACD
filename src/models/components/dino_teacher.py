@@ -27,6 +27,7 @@ class DINOv2Teacher(nn.Module):
     def __init__(self, model_name: str = "dinov2_vits14"):
         super().__init__()
 
+        self.model_name = model_name
         timm_name = self.MODEL_MAP.get(model_name, model_name)
         self.model = timm.create_model(timm_name, pretrained=True, num_classes=0, img_size=224)
         self.model.requires_grad_(False)

@@ -548,50 +548,86 @@ class Caltech101Dataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
         """
         Args:
-            root_dir (str): Caltech 256 데이터셋의 디렉터리 경로.
-            split (str): "train" 또는 "test".
-            transform (callable, optional): 적용할 변환(Optional).
+            root_dir (str): Caltech 101 dataset directory.
+            split (str): "train" or "test".
+            transform (callable, optional): transforms to apply.
         """
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
-        
+
         self.root_dir = root_dir
         self.imgs_path = os.path.join(root_dir, '101_ObjectCategories')
         self.image_paths = []
         self.labels = []
-        self.class_names = sorted([d for d in os.listdir(self.imgs_path) if os.path.isdir(os.path.join(self.imgs_path, d))])
+        self.class_names = sorted(
+            d for d in os.listdir(self.imgs_path)
+            if os.path.isdir(os.path.join(self.imgs_path, d))
+        )
+        self.label_to_idx = {class_name: idx for idx, class_name in enumerate(self.class_names)}
         self.transform = transform
         self.split = split
-        
-        train_indices = []
-        test_indices = []
-        
-        # Load images and labels by class and split within each class
-        for class_idx, class_name in enumerate(self.class_names):
-            class_dir = os.path.join(self.imgs_path, class_name)
-            class_image_paths = [os.path.join(class_dir, img_name) for img_name in os.listdir(class_dir)]
-            class_labels = [class_idx] * len(class_image_paths)
-            
-            class_train_size = int(0.8 * len(class_image_paths))
-            class_train_indices = list(range(len(self.image_paths), len(self.image_paths) + class_train_size))
-            class_test_indices = list(range(len(self.image_paths) + class_train_size, len(self.image_paths) + len(class_image_paths)))
-            
-            self.image_paths.extend(class_image_paths)
-            self.labels.extend(class_labels)
-            
-            train_indices.extend(class_train_indices)
-            test_indices.extend(class_test_indices)
-        
+
         split_file = os.path.join(root_dir, "train_test_split.txt")
-        if not os.path.exists(split_file):
+        if os.path.exists(split_file):
+            split_rows = self._read_split_file(split_file)
+        else:
+            split_rows = self._build_split_rows()
             with open(split_file, 'w') as f:
-                for idx in train_indices:
-                    f.write(f"train,{self.image_paths[idx]}\n")
-                for idx in test_indices:
-                    f.write(f"test,{self.image_paths[idx]}\n")
-        
-        split_indices = train_indices if split == "train" else test_indices
-        self.image_paths = [self.image_paths[i] for i in split_indices]
-        self.labels = [self.labels[i] for i in split_indices]
+                for mode, image_path, class_name in split_rows:
+                    f.write(f"{mode},{image_path},{class_name}\n")
+
+        for mode, image_path, class_name in split_rows:
+            if mode != split:
+                continue
+            self.image_paths.append(image_path)
+            self.labels.append(self.label_to_idx[class_name])
+
+    def _build_split_rows(self):
+        rows = []
+        rng = random.Random(42)
+
+        for class_name in self.class_names:
+            class_dir = os.path.join(self.imgs_path, class_name)
+            class_image_names = sorted(
+                img_name for img_name in os.listdir(class_dir)
+                if img_name.lower().endswith(('.jpg', '.jpeg', '.png'))
+            )
+            rng.shuffle(class_image_names)
+
+            if len(class_image_names) <= 1:
+                class_train_size = len(class_image_names)
+            else:
+                class_train_size = int(0.8 * len(class_image_names))
+                class_train_size = max(class_train_size, 1)
+                class_train_size = min(class_train_size, len(class_image_names) - 1)
+
+            train_images = class_image_names[:class_train_size]
+            test_images = class_image_names[class_train_size:]
+
+            for img_name in train_images:
+                rows.append(("train", os.path.join(class_dir, img_name), class_name))
+            for img_name in test_images:
+                rows.append(("test", os.path.join(class_dir, img_name), class_name))
+
+        return rows
+
+    @staticmethod
+    def _read_split_file(split_file):
+        rows = []
+        with open(split_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(',', 2)
+                if len(parts) == 3:
+                    mode, image_path, class_name = parts
+                elif len(parts) == 2:
+                    mode, image_path = parts
+                    class_name = os.path.basename(os.path.dirname(image_path))
+                else:
+                    raise ValueError(f"Unexpected Caltech101 split line: {line}")
+                rows.append((mode, image_path, class_name))
+        return rows
 
     def __len__(self):
         return len(self.image_paths)
@@ -600,10 +636,10 @@ class Caltech101Dataset(Dataset):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
-        
+
         if self.transform:
             image = self.transform(image)
-        
+
         return image, label
 
 

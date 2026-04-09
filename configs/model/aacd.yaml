@@ -44,8 +44,11 @@ net:
   # Must equal cca_s below (set both to the same value).
   shared_dim: 128
 
-  # Agreement temperature  w = exp(-alpha * delta)
-  # Larger -> stricter filtering of disagreed samples.
+  # Number of concept dimensions for ConceptBasis.
+  num_concepts: 128
+
+  # Agreement alpha is now estimated per-concept from data.
+  # This value is only used for AgreementModule construction (legacy compat).
   agreement_alpha: 2.0
 
   # Enable MobileViT student with patch aggregation + feature-wise distillation.
@@ -57,9 +60,10 @@ kd_criterion:
   _target_: src.models.components.aacd_criterion.AACDCriterion
   temperature: 2.0
   lambda_cls: 0.3    # grows to 1.0 dynamically over training
-  lambda_shared: 0.3 # agreement-weighted CCA distillation
-  lambda_txt: 0.2    # CLIP linguistic KD (confidence-gated)
-  lambda_geom: 0.1   # existing geometry preservation term
+  lambda_shared: 0.3 # per-concept gated CCA distillation
+  lambda_txt: 0.2    # unified concept-space text KD
+  lambda_anchor: 0.01  # EZPC matching loss weight
+  lambda_orth: 0.001   # concept basis orthogonality weight
   lambda_feat: 0.0   # experimental multi-scale term disabled by default
   class_num: ${data.train_dataset.attributes.class_num}
 
@@ -68,6 +72,16 @@ kd_criterion:
 # Set cca_s: 0 to let CCA auto-detect s from cca_tau.
 cca_s: 128
 cca_tau: 0.1
+
+# ---- AE-SVC settings (offline preprocessing before CCA) ---------------
+ae_svc_epochs: 50
+ae_svc_lr: 0.001
+ae_svc_batch_size: 256
+
+# ---- Concept basis settings (passed to AACDModule) --------------------
+num_concepts: 128
+lambda_anchor: 0.01
+lambda_orth: 0.001
 
 # Directory for caching extracted teacher features across runs.
 cache_dir: ".cache"

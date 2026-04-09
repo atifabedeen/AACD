@@ -1,12 +1,13 @@
 """
-AACD combined loss function.
+AACD combined loss function (upgraded).
 
 Active training loss:
   L = cls_w * L_cls
-    + kd_scale * lambda_shared * L_shared
-    + kd_scale * lambda_txt * L_txt_gated
-    + lambda_geom * L_geom
-    + kd_scale * lambda_feat * L_feat
+    + kd_scale * lambda_shared * L_shared   (per-concept gated)
+    + kd_scale * lambda_txt * L_txt         (unified concept-space text KD)
+    + L_concept_reg                         (anchoring + orthogonality)
+
+Removed:  geometry loss, separate CLIP-gated text KD, discrete {1,0.3,0} gates.
 """
 
 from __future__ import annotations
@@ -16,51 +17,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class GeometryPreservationLoss(nn.Module):
-    """Mean/variance/covariance regularizer on shared student features."""
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        B, d = z.shape
-        z_c = z - z.mean(dim=0, keepdim=True)
-        cov = (z_c.T @ z_c) / B
-
-        off_diag_mask = ~torch.eye(d, dtype=torch.bool, device=z.device)
-        loss_cov = (cov[off_diag_mask] ** 2).sum() / d
-        loss_var = ((cov.diagonal() - 1.0) ** 2).mean()
-        loss_mean = (z.mean(dim=0) ** 2).mean()
-        return 1.0 * loss_cov + 15.0 * loss_var + 1.0 * loss_mean
-
-
-def agreement_shared_loss(
-    student_shared: torch.Tensor,
+def concept_shared_kd_loss(
+    student_concept_acts: torch.Tensor,
     shared_target: torch.Tensor,
-    weight: torch.Tensor,
+    per_concept_gate: torch.Tensor,
 ) -> torch.Tensor:
-    per_sample = ((student_shared - shared_target) ** 2).mean(dim=1)
-    return (weight * per_sample).mean()
+    """Per-concept gated shared KD.
+
+    L_shared = (1/BK) * sum_i sum_k w^{kd}_{i,k} * ([z_hat_i]_k - [z_shared_i]_k)^2
+
+    Args:
+        student_concept_acts: student's concept activations [B, K]
+        shared_target: correlation-weighted teacher fusion [B, K]
+        per_concept_gate: w_{i,k} [B, K]
+    """
+    per_concept_error = (student_concept_acts - shared_target) ** 2  # [B, K]
+    weighted = per_concept_gate * per_concept_error  # [B, K]
+    return weighted.mean()
 
 
-def agreement_linguistic_kd_loss(
-    student_feats: torch.Tensor,
-    aligned_nlp: torch.Tensor,
-    clip_img_feats: torch.Tensor,
-    frozen_nlp_feats: torch.Tensor,
-    sample_weight: torch.Tensor | None,
-    temperature: float,
-    logit_scale: float,
+def unified_text_kd_loss(
+    student_concept_acts: torch.Tensor,
+    text_concept_targets: torch.Tensor,
+    per_concept_gate: torch.Tensor,
 ) -> torch.Tensor:
-    student_logits = logit_scale * student_feats @ aligned_nlp.T / temperature
-    teacher_logits = logit_scale * clip_img_feats @ frozen_nlp_feats.T / temperature
+    """Text KD in concept space with per-concept agreement gating.
 
-    p_student = F.log_softmax(student_logits, dim=1)
-    p_teacher = F.softmax(teacher_logits, dim=1)
-    kl_per_sample = F.kl_div(p_student, p_teacher, reduction='none').sum(dim=1)
+    Instead of separate CLIP-gated text KD, project CLIP text features for
+    the ground-truth class into concept space and distill there.
 
-    if sample_weight is None:
-        reduced = kl_per_sample.mean()
-    else:
-        reduced = (sample_weight * kl_per_sample).mean()
-    return (temperature ** 2) * reduced
+    Args:
+        student_concept_acts: student's projection into concept space [B, K]
+        text_concept_targets: CLIP text features for GT class in concept space [B, K]
+        per_concept_gate: w_{i,k} from ConceptBasis [B, K]
+    """
+    per_concept_error = (student_concept_acts - text_concept_targets) ** 2  # [B, K]
+    weighted_error = per_concept_gate * per_concept_error  # [B, K]
+    return weighted_error.mean()
 
 
 def feature_wise_loss(
@@ -82,35 +75,20 @@ class AACDCriterion:
         lambda_cls: float = 0.01,
         lambda_shared: float = 0.3,
         lambda_txt: float = 0.2,
-        lambda_geom: float = 0.1,
-        lambda_feat: float = 0.15,
+        lambda_anchor: float = 0.01,
+        lambda_orth: float = 0.001,
+        lambda_feat: float = 0.0,
         class_num: int = 200,
     ):
         self.temperature = temperature
         self.lambda_cls = lambda_cls
         self.lambda_shared = lambda_shared
         self.lambda_txt = lambda_txt
-        self.lambda_geom = lambda_geom
+        self.lambda_anchor = lambda_anchor
+        self.lambda_orth = lambda_orth
         self.lambda_feat = lambda_feat
         self.class_num = class_num
         self.ce = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.geo_loss = GeometryPreservationLoss()
-        self.logit_scale = float(1.0 / 0.07)
-
-    @staticmethod
-    def _text_kd_weight(outputs: dict, labels: torch.Tensor) -> torch.Tensor:
-        clip_top1 = outputs['clip_top1']
-        clip_margin = outputs['clip_margin']
-        clip_margin_lo = outputs['clip_margin_lo']
-        clip_margin_hi = outputs['clip_margin_hi']
-
-        sample_weight = torch.zeros_like(clip_margin)
-        label_match = clip_top1.eq(labels)
-        full = label_match & (clip_margin >= clip_margin_hi)
-        soft = label_match & (clip_margin >= clip_margin_lo) & (clip_margin < clip_margin_hi)
-        sample_weight[soft] = 0.5
-        sample_weight[full] = 1.0
-        return sample_weight
 
     def __call__(
         self,
@@ -123,44 +101,38 @@ class AACDCriterion:
         cls_w = self.lambda_cls + progress * (1.0 - self.lambda_cls)
         kd_scale = 1.0 - progress * 0.5
 
-        shared_weight = outputs['kd_shared_weight']
-        text_weight = self._text_kd_weight(outputs, labels)
-        logit_scale = outputs.get('clip_logit_scale', self.logit_scale)
-        if torch.is_tensor(logit_scale):
-            logit_scale = float(logit_scale.detach().item())
-
+        # Classification loss
         loss_cls = self.ce(outputs['logits'], labels)
-        loss_shared = agreement_shared_loss(
-            outputs['student_shared'],
-            outputs['shared_target'],
-            shared_weight,
-        )
-        loss_txt_raw = agreement_linguistic_kd_loss(
-            student_feats=outputs['hidden_features'],
-            aligned_nlp=outputs['aligned_nlp'],
-            clip_img_feats=outputs['clip_img_feats'],
-            frozen_nlp_feats=outputs['frozen_nlp_feats'],
-            sample_weight=None,
-            temperature=self.temperature,
-            logit_scale=logit_scale,
-        )
-        loss_txt = agreement_linguistic_kd_loss(
-            student_feats=outputs['hidden_features'],
-            aligned_nlp=outputs['aligned_nlp'],
-            clip_img_feats=outputs['clip_img_feats'],
-            frozen_nlp_feats=outputs['frozen_nlp_feats'],
-            sample_weight=text_weight,
-            temperature=self.temperature,
-            logit_scale=logit_scale,
-        )
-        loss_geom = self.geo_loss(outputs['student_shared'])
 
+        # Per-concept gated shared KD
+        loss_shared = concept_shared_kd_loss(
+            outputs['student_concept_acts'],
+            outputs['shared_target'],
+            outputs['per_concept_gate'],
+        )
+
+        # Unified concept-space text KD
+        loss_txt = unified_text_kd_loss(
+            outputs['student_concept_acts'],
+            outputs['text_concept_targets'],
+            outputs['per_concept_gate'],
+        )
+
+        # Concept basis regularization (replaces geometry loss)
+        loss_concept_reg = (
+            self.lambda_anchor * outputs['concept_anchoring_loss']
+            + self.lambda_orth * outputs['concept_orth_loss']
+        )
+
+        # Feature-wise distillation (optional, for MobileViT)
         proj_inter = outputs.get('projected_intermediates')
-        if proj_inter is not None:
+        if proj_inter is not None and self.lambda_feat > 0:
+            # Use mean of per_concept_gate as a per-sample weight for feature KD
+            feat_weight = outputs['per_concept_gate'].mean(dim=1)  # [B]
             loss_feat = feature_wise_loss(
                 proj_inter,
                 outputs['shared_target'],
-                shared_weight,
+                feat_weight,
             )
         else:
             loss_feat = torch.tensor(0.0, device=loss_cls.device)
@@ -169,13 +141,10 @@ class AACDCriterion:
             cls_w * loss_cls
             + kd_scale * self.lambda_shared * loss_shared
             + kd_scale * self.lambda_txt * loss_txt
-            + self.lambda_geom * loss_geom
+            + loss_concept_reg
             + kd_scale * self.lambda_feat * loss_feat
         )
 
-        full_shared = (shared_weight == 1.0).float()
-        soft_shared = ((shared_weight > 0.0) & (shared_weight < 1.0)).float()
-        label_only = (shared_weight == 0.0).float()
         agree = outputs['agree_top1'].float()
 
         return {
@@ -183,18 +152,18 @@ class AACDCriterion:
             'cls': loss_cls.item(),
             'shared': loss_shared.item(),
             'txt': loss_txt.item(),
-            'txt_raw': loss_txt_raw.item(),
-            'geom': loss_geom.item(),
+            'txt_raw': loss_txt.item(),
+            'concept_reg': loss_concept_reg.item(),
             'feat': loss_feat.item() if torch.is_tensor(loss_feat) else loss_feat,
             'agreement_rate': agree.mean().item(),
             'mean_agreement': agree.mean().item(),
-            'mean_delta': outputs['delta'].mean().item(),
-            'mean_clip_margin': outputs['clip_margin'].mean().item(),
-            'mean_dino_margin': outputs['dino_margin'].mean().item(),
-            'full_shared_frac': full_shared.mean().item(),
-            'soft_shared_frac': soft_shared.mean().item(),
-            'label_only_frac': label_only.mean().item(),
-            'mean_text_kd_weight': text_weight.mean().item(),
+            'mean_delta': outputs['mean_delta'],
+            'mean_clip_margin': 0.0,
+            'mean_dino_margin': 0.0,
+            'full_shared_frac': 0.0,
+            'soft_shared_frac': 0.0,
+            'label_only_frac': 0.0,
+            'mean_text_kd_weight': 1.0,
             'cls_w': cls_w,
             'kd_scale': kd_scale,
         }

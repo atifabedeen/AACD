@@ -1,18 +1,27 @@
 """
-AACD Lightning module.
+AACD Lightning module (upgraded).
+
+Changes from original:
+  - AE-SVC preprocessing on teacher features before CCA fitting
+  - ConceptBasis initialization and calibration after CCA
+  - Removed geometry loss logging (replaced by concept_reg)
+  - Forward now passes labels for text concept targets
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import Any, Dict, Tuple
 
 import torch
+import torch.nn.functional as F
 from lightning import LightningModule
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 
+from src.models.components.ae_svc import AE_SVC
 from src.models.components.aacd_criterion import AACDCriterion
 from src.models.components.cca_module import CCAProjection
 
@@ -29,6 +38,12 @@ class AACDModule(LightningModule):
         cca_tau: float = 0.1,
         cache_dir: str = '.',
         compile: bool = False,
+        ae_svc_epochs: int = 50,
+        ae_svc_lr: float = 1e-3,
+        ae_svc_batch_size: int = 256,
+        num_concepts: int = 128,
+        lambda_anchor: float = 0.01,
+        lambda_orth: float = 0.001,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=['net', 'optimizer', 'scheduler', 'kd_criterion'], logger=False)
@@ -43,6 +58,9 @@ class AACDModule(LightningModule):
         self.cca_s = cca_s
         self.cca_tau = cca_tau
         self.cache_dir = cache_dir
+        self.ae_svc_epochs = ae_svc_epochs
+        self.ae_svc_lr = ae_svc_lr
+        self.ae_svc_batch_size = ae_svc_batch_size
 
         num_classes = self._aacd_net.data_attributes.class_num
         self.train_acc = Accuracy(task='multiclass', num_classes=num_classes)
@@ -54,7 +72,7 @@ class AACDModule(LightningModule):
         self.cls_loss = MeanMetric()
         self.shared_loss = MeanMetric()
         self.kd_loss = MeanMetric()
-        self.geom_loss = MeanMetric()
+        self.concept_reg_loss = MeanMetric()
         self.feat_loss = MeanMetric()
         self.txt_loss = MeanMetric()
         self.patch_entropy = MeanMetric()
@@ -69,21 +87,129 @@ class AACDModule(LightningModule):
             self.net = torch.compile(self.net)
 
         if stage == 'fit':
-            self._initialize_agreement()
-        elif stage == 'test' and not self._aacd_net.agreement._initialized:
+            self._setup_aacd_state()
+        elif stage == 'test' and not self._aacd_net.initialized_for_distillation:
             raise RuntimeError(
-                'AgreementModule was not initialized after loading checkpoint. '
+                'AACD teacher alignment state was not restored after loading checkpoint. '
                 'Ensure the checkpoint was saved from a trained AACD model.'
             )
 
+    def _cache_stem(self, dm) -> str:
+        net = self._aacd_net
+        key_parts = [
+            f"data={dm.hparams.attributes.name}",
+            f"split_seed={getattr(dm.hparams, 'split_seed', 'na')}",
+            f"clip_dim={getattr(net, 'clip_feature_dim', 'na')}",
+            f"dino_dim={getattr(net, 'dino_feature_dim', 'na')}",
+            f"shared_dim={net.agreement.shared_dim}",
+            f"num_concepts={net.concept_basis.num_concepts}",
+            f"cca_s={self.cca_s}",
+            f"cca_tau={self.cca_tau}",
+        ]
+        digest = hashlib.sha1('|'.join(key_parts).encode('utf-8')).hexdigest()[:12]
+        data_name = dm.hparams.attributes.name.replace('/', '_')
+        return f'{data_name}_{digest}'
+
+    def _feature_cache_path(self, dm) -> str:
+        return os.path.join(self.cache_dir, f'aacd_features_v3_{self._cache_stem(dm)}.pth')
+
+    def _init_state_path(self, dm) -> str:
+        return os.path.join(self.cache_dir, f'aacd_init_v1_{self._cache_stem(dm)}.pth')
+
+    def _move_aacd_modules_to_device(self) -> None:
+        device = self.device
+        net = self._aacd_net
+        net.agreement.to(device)
+        net.concept_basis.to(device)
+        net.clip_ae_encoder.to(device)
+        net.dino_ae_encoder.to(device)
+
+    def _save_aacd_state(self, init_state_path: str) -> None:
+        net = self._aacd_net
+        payload = {
+            'agreement': net.agreement.state_dict(),
+            'concept_basis': net.concept_basis.state_dict(),
+            'clip_ae_encoder': net.clip_ae_encoder.state_dict(),
+            'dino_ae_encoder': net.dino_ae_encoder.state_dict(),
+            'clip_ae_ready': bool(net._clip_ae_ready.item()),
+            'dino_ae_ready': bool(net._dino_ae_ready.item()),
+        }
+        torch.save(payload, init_state_path)
+
+    def _load_aacd_state(self, init_state_path: str) -> None:
+        net = self._aacd_net
+        payload = torch.load(init_state_path, map_location='cpu')
+        net.agreement.load_state_dict(payload['agreement'])
+        net.concept_basis.load_state_dict(payload['concept_basis'])
+        net.clip_ae_encoder.load_state_dict(payload['clip_ae_encoder'])
+        net.dino_ae_encoder.load_state_dict(payload['dino_ae_encoder'])
+        net._freeze_module(net.clip_ae_encoder)
+        net._freeze_module(net.dino_ae_encoder)
+        net._clip_ae_ready.fill_(bool(payload.get('clip_ae_ready', True)))
+        net._dino_ae_ready.fill_(bool(payload.get('dino_ae_ready', True)))
+        self._move_aacd_modules_to_device()
+
+    def _restore_or_initialize_aacd_state(self, dm) -> None:
+        self._move_aacd_modules_to_device()
+        if self._aacd_net.initialized_for_distillation:
+            return
+
+        init_state_path = self._init_state_path(dm)
+        if os.path.exists(init_state_path):
+            print(f'[AACD] Loading cached AACD initialization from {init_state_path}')
+            self._load_aacd_state(init_state_path)
+            return
+
+        self._initialize_agreement()
+        self._save_aacd_state(init_state_path)
+        print(f'[AACD] Cached AACD initialization saved to {init_state_path}')
+
+    def _setup_aacd_state(self) -> None:
+        dm = self.trainer.datamodule
+        world_size = getattr(self.trainer, 'world_size', 1)
+
+        if world_size <= 1:
+            self._restore_or_initialize_aacd_state(dm)
+            return
+
+        if self.trainer.is_global_zero:
+            self._restore_or_initialize_aacd_state(dm)
+        self.trainer.strategy.barrier('aacd_init')
+        if not self.trainer.is_global_zero:
+            self._load_aacd_state(self._init_state_path(dm))
+        self.trainer.strategy.barrier('aacd_init_loaded')
+
+    def _train_ae_svc(self, features: torch.Tensor, input_dim: int, latent_dim: int) -> Tuple[torch.Tensor, torch.nn.Module]:
+        """Train AE-SVC offline on cached features and return transformed features + encoder."""
+        device = features.device
+        model = AE_SVC(input_dim, latent_dim).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.ae_svc_lr)
+        dataset = TensorDataset(features)
+        loader = DataLoader(dataset, batch_size=self.ae_svc_batch_size, shuffle=True)
+
+        model.train()
+        for epoch in range(self.ae_svc_epochs):
+            for (batch,) in loader:
+                z, x_rec = model(batch)
+                loss, _ = AE_SVC.compute_losses(z, batch, x_rec)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            if (epoch + 1) % 10 == 0:
+                print(f'  [AE-SVC] epoch {epoch+1}/{self.ae_svc_epochs}, loss={loss.item():.4f}')
+
+        model.eval()
+        with torch.no_grad():
+            z_all, _ = model(features)
+        return z_all, model.encoder
+
     def _initialize_agreement(self) -> None:
         dm = self.trainer.datamodule
-        data_name = dm.hparams.attributes.name
         device = self.device
         net = self._aacd_net
 
         os.makedirs(self.cache_dir, exist_ok=True)
-        cache_path = os.path.join(self.cache_dir, f'aacd_features_v2_{data_name}.pth')
+        cache_path = self._feature_cache_path(dm)
 
         if os.path.exists(cache_path):
             print(f'[AACD] Loading cached teacher features from {cache_path}')
@@ -97,18 +223,68 @@ class AACDModule(LightningModule):
             torch.save({'clip': clip_feats, 'dino': dino_feats, 'labels': labels_all}, cache_path)
             print(f'[AACD] Cached features saved to {cache_path}')
 
+        clip_feats = clip_feats.float().to(device)
+        dino_feats = dino_feats.float().to(device)
+
         clip_dim = clip_feats.shape[1]
         dino_dim = dino_feats.shape[1]
+
+        print('[AACD] Training AE-SVC for CLIP features ...')
+        clip_feats_svc, clip_ae_encoder = self._train_ae_svc(clip_feats, clip_dim, clip_dim)
+        print('[AACD] Training AE-SVC for DINO features ...')
+        dino_feats_svc, dino_ae_encoder = self._train_ae_svc(dino_feats, dino_dim, dino_dim)
+
+        net.set_ae_encoders(clip_ae_encoder, dino_ae_encoder)
+
+        clip_feats = clip_feats_svc
+        dino_feats = dino_feats_svc
+        print('[AACD] AE-SVC preprocessing complete.')
+
         s = self.cca_s if self.cca_s > 0 else None
         cca = CCAProjection(dim_c=clip_dim, dim_d=dino_dim, s=s, tau=self.cca_tau)
-        cca.fit(clip_feats.numpy(), dino_feats.numpy())
+        cca.fit(clip_feats.cpu().numpy(), dino_feats.cpu().numpy())
 
         assert net.agreement.shared_dim == cca.s, (
             f'AgreementModule.shared_dim={net.agreement.shared_dim} '
             f'!= cca.s={cca.s}. Set cca_s={cca.s} in the config.'
         )
-        net.agreement.initialize(cca, clip_feats, dino_feats, labels_all)
+        net.agreement.initialize(cca, clip_feats.cpu(), dino_feats.cpu(), labels_all)
         print('[AACD] Agreement module initialized.')
+
+        num_concepts = net.concept_basis.num_concepts
+        shared_dim = net.agreement.shared_dim
+
+        text_feats = net.frozen_nlp_features.float().to(device)
+        with torch.no_grad():
+            text_feats_svc = clip_ae_encoder(text_feats)
+        mu_C = net.agreement.mu_C.to(device)
+        cca_A = net.agreement.cca_A.to(device)
+        text_feats_cca = (text_feats_svc - mu_C) @ cca_A.T
+
+        projected = text_feats_cca.T
+        projected = F.normalize(projected, dim=0)
+
+        if projected.shape[1] < num_concepts:
+            extra = num_concepts - projected.shape[1]
+            rand_dirs = torch.randn(shared_dim, extra, device=device)
+            rand_dirs = F.normalize(rand_dirs, dim=0)
+            projected = torch.cat([projected, rand_dirs], dim=1)
+        else:
+            projected = projected[:, :num_concepts]
+
+        net.concept_basis.init_from_projected_text(projected)
+
+        mu_D = net.agreement.mu_D.to(device)
+        cca_B = net.agreement.cca_B.to(device)
+        c_tilde_train = (clip_feats - mu_C) @ cca_A.T
+        d_tilde_train = (dino_feats - mu_D) @ cca_B.T
+
+        cca_corrs = torch.tensor(cca.rho_s, dtype=torch.float32, device=device)
+        net.concept_basis.calibrate(c_tilde_train, d_tilde_train, cca_corrs)
+        print(
+            f'[AACD] ConceptBasis initialized: {num_concepts} concepts, alpha range '
+            f'[{net.concept_basis.alpha.min():.2f}, {net.concept_basis.alpha.max():.2f}]'
+        )
 
     @torch.no_grad()
     def _extract_features(
@@ -158,8 +334,8 @@ class AACDModule(LightningModule):
             torch.cat(all_labels, dim=0),
         )
 
-    def forward(self, x: torch.Tensor) -> dict:
-        return self.net(x)
+    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> dict:
+        return self.net(x, labels=labels)
 
     def on_train_start(self) -> None:
         self.val_loss.reset()
@@ -168,7 +344,7 @@ class AACDModule(LightningModule):
 
     def model_step(self, batch: Tuple[torch.Tensor, torch.Tensor]):
         x, y = batch
-        outputs = self.forward(x)
+        outputs = self.forward(x, labels=y)
         loss_dict = self.kd_criterion(
             outputs,
             y,
@@ -186,15 +362,9 @@ class AACDModule(LightningModule):
         return torch.stack(grads).norm(2)
 
     def _log_aux(self, prefix: str, loss_dict: dict, outputs: dict) -> None:
-        self.log(f'{prefix}/agree', loss_dict['agreement_rate'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/delta', loss_dict['mean_delta'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/clip_margin', loss_dict['mean_clip_margin'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/dino_margin', loss_dict['mean_dino_margin'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/shared_full', loss_dict['full_shared_frac'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/shared_soft', loss_dict['soft_shared_frac'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/label_only', loss_dict['label_only_frac'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/text_weight', loss_dict['mean_text_kd_weight'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f'{prefix}/patch_entropy', outputs['patch_entropy'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f'{prefix}/agree', loss_dict['agreement_rate'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{prefix}/delta', loss_dict['mean_delta'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f'{prefix}/patch_entropy', outputs['patch_entropy'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         loss_dict, preds, targets, outputs = self.model_step(batch)
@@ -205,7 +375,7 @@ class AACDModule(LightningModule):
         self.cls_loss(loss_dict['cls'])
         self.shared_loss(loss_dict['shared'])
         self.kd_loss(loss_dict['shared'] + loss_dict['txt'])
-        self.geom_loss(loss_dict['geom'])
+        self.concept_reg_loss(loss_dict['concept_reg'])
         self.feat_loss(loss_dict['feat'])
         self.txt_loss(loss_dict['txt'])
         self.patch_entropy(outputs['patch_entropy'])
@@ -216,8 +386,8 @@ class AACDModule(LightningModule):
         self.log('train/shared', self.shared_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train/kd', self.kd_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train/txt', self.txt_loss, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train/txt_raw', loss_dict['txt_raw'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train/geom', self.geom_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/txt_raw', loss_dict['txt_raw'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('train/concept_reg', self.concept_reg_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train/feat', self.feat_loss, on_step=False, on_epoch=True, prog_bar=True)
         self._log_aux('train', loss_dict, outputs)
         return loss
@@ -245,10 +415,10 @@ class AACDModule(LightningModule):
         self.val_acc(preds, targets)
         self.log('val/loss', self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val/acc', self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val/shared', loss_dict['shared'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log('val/txt', loss_dict['txt'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log('val/txt_raw', loss_dict['txt_raw'], on_step=False, on_epoch=True, prog_bar=False)
-        self.log('val/geom', loss_dict['geom'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val/shared', loss_dict['shared'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('val/txt', loss_dict['txt'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('val/txt_raw', loss_dict['txt_raw'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('val/concept_reg', loss_dict['concept_reg'], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
         self._log_aux('val', loss_dict, outputs)
 
     def on_validation_epoch_end(self) -> None:

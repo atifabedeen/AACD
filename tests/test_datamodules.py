@@ -1,9 +1,12 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 
 from src.data.kd_datamodule import KDDataModule
+from src.data.components.kd_dataloader import Caltech101Dataset
 
 
 class DummyBaseDataset(Dataset):
@@ -72,3 +75,34 @@ def test_kd_datamodule_uses_official_train_for_val_and_keeps_test_untouched() ->
     dm_same.setup()
     assert dm.data_train.indices == dm_same.data_train.indices
     assert dm.data_val.indices == dm_same.data_val.indices
+
+def test_caltech101_dataset_honors_saved_train_test_split(tmp_path: Path) -> None:
+    root = tmp_path / "7_CALTECH101"
+    images_root = root / "101_ObjectCategories"
+    for class_name in ("accordion", "airplanes"):
+        class_dir = images_root / class_name
+        class_dir.mkdir(parents=True, exist_ok=True)
+        for idx in range(3):
+            Image.new("RGB", (8, 8), color=(idx * 30, 0, 0)).save(class_dir / f"img_{idx}.jpg")
+
+    split_file = root / "train_test_split.txt"
+    split_file.write_text(
+        "\n".join([
+            f"train,{images_root / 'accordion' / 'img_0.jpg'},accordion",
+            f"train,{images_root / 'accordion' / 'img_1.jpg'},accordion",
+            f"test,{images_root / 'accordion' / 'img_2.jpg'},accordion",
+            f"train,{images_root / 'airplanes' / 'img_0.jpg'},airplanes",
+            f"train,{images_root / 'airplanes' / 'img_1.jpg'},airplanes",
+            f"test,{images_root / 'airplanes' / 'img_2.jpg'},airplanes",
+        ])
+        + "\n"
+    )
+
+    train_ds = Caltech101Dataset(str(root), split="train")
+    test_ds = Caltech101Dataset(str(root), split="test")
+
+    assert len(train_ds) == 4
+    assert len(test_ds) == 2
+    assert set(train_ds.image_paths).isdisjoint(set(test_ds.image_paths))
+    assert {Path(path).name for path in test_ds.image_paths} == {"img_2.jpg"}
+

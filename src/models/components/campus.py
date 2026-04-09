@@ -6,6 +6,7 @@ import open_clip
 
 feature_norm = lambda x: x / (x.norm(dim=-1, keepdim=True) + 1e-10)
 
+
 class TeacherStudent(nn.Module):
     def __init__(self, teacher, student, data_attributes, use_teacher=True):
         super(TeacherStudent, self).__init__()
@@ -17,14 +18,14 @@ class TeacherStudent(nn.Module):
             self.teacher = TeacherNet(teacher)
             self.align = AlignNet(self.teacher.last_features_dim, self.student.num_features)
             self.frozen_nlp_features = self.get_frozen_nlp_features(data_attributes)
-    
+
     def get_frozen_nlp_features(self, attributes):
         prompt_tmpl = attributes.prompt_tmpl
         classes_list = list(attributes.classes.values())
         text_tokens = self.teacher.tokenizer([prompt_tmpl.format(word) for word in classes_list])
         nlp_features = self.teacher.encode_text(text_tokens).detach()
         return feature_norm(nlp_features)
-    
+
     def forward(self, x):
         if self.teacher:
             clip_img_features = self.teacher(x)
@@ -35,10 +36,11 @@ class TeacherStudent(nn.Module):
         return self.student(x)
 
 
-
 class TeacherNet(nn.Module):
     def __init__(self, teacher):
         super(TeacherNet, self).__init__()
+        self.arch = teacher.arch
+        self.pretrained = teacher.pretrained
         self.model, _, _ = open_clip.create_model_and_transforms(teacher.arch, pretrained=teacher.pretrained)
         self.model.requires_grad_(False)
         self.model.eval()
@@ -47,7 +49,6 @@ class TeacherNet(nn.Module):
         self.last_features_dim = self.model.transformer.resblocks[-1].mlp.c_proj.out_features
 
     def train(self, mode: bool = True):
-        # Keep frozen teacher permanently in eval mode
         super().train(False)
         return self
 
@@ -62,28 +63,27 @@ class TeacherNet(nn.Module):
             clip_img_features = self.encode_image(x).detach()
         clip_img_features = feature_norm(clip_img_features)
         return clip_img_features
-    
+
 
 class AlignNet(nn.Module):
     def __init__(self, in_features, out_features):
         super(AlignNet, self).__init__()
 
         self.align_img_layer = nn.Sequential(
-            nn.Linear(in_features, out_features), 
-            nn.ReLU(), 
-            nn.Linear(out_features, out_features)
-            )
-        self.align_nlp_layer = nn.Sequential(
-            nn.Linear(in_features, out_features), 
-            nn.ReLU(), 
-            nn.Linear(out_features, out_features)
+            nn.Linear(in_features, out_features),
+            nn.ReLU(),
+            nn.Linear(out_features, out_features),
         )
-    
+        self.align_nlp_layer = nn.Sequential(
+            nn.Linear(in_features, out_features),
+            nn.ReLU(),
+            nn.Linear(out_features, out_features),
+        )
+
     def forward(self, x, clip_nlp_features):
         align_img = self.align_img_layer(x)
         align_nlp = self.align_nlp_layer(clip_nlp_features)
         return feature_norm(align_img), feature_norm(align_nlp)
-
 
 
 class StudentNet(nn.Module):
@@ -93,14 +93,14 @@ class StudentNet(nn.Module):
         self.num_features = None
         if self.use_teacher:
             origin_model = models.__dict__[student.arch](pretrained=True)
-            self.model  = ModifiedResNet(origin_model, class_num)
+            self.model = ModifiedResNet(origin_model, class_num)
             self.num_features = self.model.num_features
         else:
             self.model = models.__dict__[student.arch](pretrained=True)
             try:
                 num_features = self.model.fc.in_features
                 self.model.fc = nn.Linear(num_features, class_num)
-            except:
+            except Exception:
                 num_features = self.model.classifier[1].in_features
                 self.model.classifier[1] = nn.Linear(num_features, class_num)
 
@@ -120,9 +120,9 @@ class ModifiedResNet(torch.nn.Module):
         try:
             num_features = origin_model.fc.in_features
             self.resnet.fc = nn.Identity()
-        except:
+        except Exception:
             num_features = origin_model.classifier[1].in_features
-            self.resnet.classifier  = nn.Identity()
+            self.resnet.classifier = nn.Identity()
         self.drop = nn.Dropout(p=dropout)
         self.linear_cls = nn.Linear(num_features, classnum)
         self.num_features = num_features
@@ -130,11 +130,7 @@ class ModifiedResNet(torch.nn.Module):
     def forward(self, x):
         hidden_features = self.resnet(x)
         out = self.linear_cls(self.drop(hidden_features))
-
         return hidden_features, out
-
-
-
 
 
 if __name__ == "__main__":
