@@ -4,30 +4,23 @@
 #   python src/train.py experiment=aacd_fgvc
 
 defaults:
-  - override /model: aacd
+  - override /model: resnet_supervised
   - override /data: kd_data
   - override /callbacks: default
   - override /trainer: ddp
   - override /data/attributes: 1_FGVC_AIRCRAFT
 
-tags: ["aacd", "fgvc", "resnet18"]
+tags: ["ablation", "FGVC", "resnet18", "direct"]
 
 seed: 42
 
 trainer:
   max_epochs: 150
+  devices: [1, 2]
 
 data:
-  batch_size: 256
+  batch_size: 64
 
-model:
-  net:
-    student:
-      arch: resnet18
-    dino:
-      model_name: dinov2_vits14
-    shared_dim: 128
-    agreement_alpha: 2.0
-  kd_criterion:
-    lambda_feat: 0.0
-  cca_s: 128
+logger:
+  wandb:
+    name: "${data.data_name}_S(${model.net.student.arch})_direct_${model.use_teacher}"

@@ -2,13 +2,18 @@ import torch
 from torch import nn
 import torchvision.models as models
 
-import open_clip
+try:
+    import open_clip
+except ImportError:  # pragma: no cover - only needed for teacher-backed runs
+    open_clip = None
 
 feature_norm = lambda x: x / (x.norm(dim=-1, keepdim=True) + 1e-10)
 
 class TeacherNet(nn.Module):
     def __init__(self, teacher):
         super(TeacherNet, self).__init__()
+        if open_clip is None:
+            raise ImportError("open_clip is required to instantiate TeacherNet")
         self.arch = teacher.arch
         self.pretrained = teacher.pretrained
         self.model, _, _ = open_clip.create_model_and_transforms(teacher.arch, pretrained=teacher.pretrained)
@@ -71,7 +76,7 @@ class ModifiedResNet(torch.nn.Module):
         except Exception:
             num_features = origin_model.classifier[1].in_features
             self.resnet.classifier = nn.Identity()
-        self.drop = nn.Dropout(p=dropout)
+        self.drop = nn.Dropout(p=0)
         self.linear_cls = nn.Linear(num_features, classnum)
         self.num_features = num_features
 
