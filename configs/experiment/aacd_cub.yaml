@@ -31,14 +31,15 @@ model:
     dino:
       model_name: dinov2_vits14
     shared_dim: 128
-    num_concepts: 128
-    agreement_alpha: 2.0
+    kernel_name: poly
+    text_kernel_name: cosine
+    kernel_degree: 3
+    text_preproc: raw
+    use_ae_svc: true
   kd_criterion:
-    lambda_feat: 0.0
-    lambda_anchor: 0.01
-    lambda_orth: 0.001
-  cca_s: 128
+    lambda_cls: 1.0
+    lambda_clip: 0.2
+    lambda_dino: 0.6
+    lambda_txt: 0.2
+  use_ae_svc: true
   ae_svc_epochs: 50
-  num_concepts: 128
-  lambda_anchor: 0.01
-  lambda_orth: 0.001

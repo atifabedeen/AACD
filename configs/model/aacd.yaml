@@ -16,6 +16,9 @@ scheduler:
 # AACD always uses frozen teachers, so keep it enabled here.
 use_teacher: true
 
+# Whether to use AE-SVC preprocessing on teacher features.
+use_ae_svc: true
+
 # ---- Network ----------------------------------------------------------
 net:
   _target_: src.models.components.aacd_campus.AACDTeacherStudent
@@ -40,48 +43,37 @@ net:
   # Dataset attributes injected automatically
   data_attributes: ${data.train_dataset.attributes}
 
-  # CCA shared space dimensionality.
-  # Must equal cca_s below (set both to the same value).
+  # Shared projection dimensionality for kernel computation.
   shared_dim: 128
 
-  # Number of concept dimensions for ConceptBasis.
-  num_concepts: 128
+  # Kernel settings
+  kernel_name: poly            # "poly" or "cosine"
+  text_kernel_name: cosine     # kernel for text features
+  kernel_degree: 3             # polynomial degree
 
-  # Agreement alpha is now estimated per-concept from data.
-  # This value is only used for AgreementModule construction (legacy compat).
-  agreement_alpha: 2.0
+  # Text preprocessing: "raw" (use frozen CLIP text features directly)
+  # or "clip_ae" (pass through CLIP AE encoder first)
+  text_preproc: raw
+
+  # AE-SVC toggle (must match model-level use_ae_svc)
+  use_ae_svc: true
 
   # Enable MobileViT student with patch aggregation + feature-wise distillation.
   # Set to false to fall back to ResNet student (original behaviour).
   use_mobilevit: false
 
-# ---- AACD loss --------------------------------------------------------
+# ---- AACD kernel loss -------------------------------------------------
 kd_criterion:
-  _target_: src.models.components.aacd_criterion.AACDCriterion
-  temperature: 2.0
-  lambda_cls: 0.3    # grows to 1.0 dynamically over training
-  lambda_shared: 0.3 # per-concept gated CCA distillation
-  lambda_txt: 0.2    # unified concept-space text KD
-  lambda_anchor: 0.01  # EZPC matching loss weight
-  lambda_orth: 0.001   # concept basis orthogonality weight
-  lambda_feat: 0.0   # experimental multi-scale term disabled by default
-  class_num: ${data.train_dataset.attributes.class_num}
+  _target_: src.models.components.aacd_criterion.AACDKernelCriterion
+  lambda_cls: 1.0
+  lambda_clip: 0.2
+  lambda_dino: 0.6
+  lambda_txt: 0.2
 
-# ---- CCA settings (used in AACDModule.setup) -------------------------
-# cca_s must equal net.shared_dim above.
-# Set cca_s: 0 to let CCA auto-detect s from cca_tau.
-cca_s: 128
-cca_tau: 0.1
-
-# ---- AE-SVC settings (offline preprocessing before CCA) ---------------
+# ---- AE-SVC settings (offline preprocessing) --------------------------
 ae_svc_epochs: 50
 ae_svc_lr: 0.001
 ae_svc_batch_size: 256
-
-# ---- Concept basis settings (passed to AACDModule) --------------------
-num_concepts: 128
-lambda_anchor: 0.01
-lambda_orth: 0.001
 
 # Directory for caching extracted teacher features across runs.
 cache_dir: ".cache"
